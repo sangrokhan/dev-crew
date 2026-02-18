@@ -85,6 +85,7 @@ class OAuthCloneClient:
                 "state": state,
                 "code_challenge_method": "S256",
                 "code_challenge": code_challenge,
+                **config.authorize_params,
             }
         )
         auth_url = f"{config.authorize_url}?{query}"

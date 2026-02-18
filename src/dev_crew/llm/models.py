@@ -20,6 +20,7 @@ class OAuthProviderConfig(BaseModel):
     client_id: str
     scopes: list[str] = Field(default_factory=list)
     redirect_uri: str = "http://127.0.0.1:1455/callback"
+    authorize_params: dict[str, str] = Field(default_factory=dict)
 
 
 class OAuthToken(BaseModel):
