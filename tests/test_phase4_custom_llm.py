@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 from datetime import datetime, timedelta, timezone
@@ -17,8 +18,10 @@ from dev_crew.llm.models import (
     ProviderId,
 )
 from dev_crew.llm.oauth_clone import OAuthCloneClient
+from dev_crew.llm.provider_auth import build_provider_auth_headers, parse_google_antigravity_api_key
 from dev_crew.llm.router import ProviderRouter
 from dev_crew.llm.token_store import FileTokenStore
+from dev_crew.llm.usage_tracker import LLMUsageTracker
 
 
 def _provider_configs() -> dict[ProviderId, OAuthProviderConfig]:
@@ -311,3 +314,140 @@ def test_custom_llm_adapter_skips_refresh_when_not_near_expiry(tmp_path: Path) -
     )
     assert response.provider == ProviderId.OPENAI_CODEX
     assert refresh_calls["count"] == 0
+
+
+def test_custom_llm_adapter_uses_antigravity_token_json_payload(tmp_path: Path) -> None:
+    store = FileTokenStore(str(tmp_path / "auth-profiles.json"))
+    store.save_profile(
+        OAuthProfile(
+            provider=ProviderId.GOOGLE_ANTIGRAVITY,
+            token=OAuthToken(
+                access_token="anti-token",
+                refresh_token="anti-refresh",
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                project_id="sample-project",
+            ),
+        )
+    )
+
+    adapter = CustomLLMAdapter(config=CustomLLMConfig(), token_store=store, logger=EventLogger())
+
+    def provider_runner(provider: ProviderId, token: str, model: str, prompt: str) -> str:
+        assert provider == ProviderId.GOOGLE_ANTIGRAVITY
+        assert model == "antigravity-fast"
+        parsed = json.loads(token)
+        assert parsed == {"token": "anti-token", "projectId": "sample-project"}
+        return f"ok: {prompt}"
+
+    response = adapter.invoke(
+        LLMRequest(model="antigravity-fast", prompt="hello"),
+        provider_runner,
+    )
+    assert response.provider == ProviderId.GOOGLE_ANTIGRAVITY
+
+
+def test_oauth_refresh_keeps_existing_project_id_when_missing_from_payload(tmp_path: Path) -> None:
+    store = FileTokenStore(str(tmp_path / "auth-profiles.json"))
+    store.save_profile(
+        OAuthProfile(
+            provider=ProviderId.GOOGLE_ANTIGRAVITY,
+            token=OAuthToken(
+                access_token="old-token",
+                refresh_token="anti-refresh",
+                expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                project_id="project-1",
+            ),
+        )
+    )
+
+    adapter = CustomLLMAdapter(config=CustomLLMConfig(), token_store=store, logger=EventLogger())
+
+    def provider_runner(provider: ProviderId, token: str, model: str, prompt: str) -> str:
+        del provider, model, prompt
+        parsed = json.loads(token)
+        assert parsed == {"token": "new-token", "projectId": "project-1"}
+        return "ok"
+
+    adapter.invoke(
+        LLMRequest(model="antigravity-fast", prompt="hello"),
+        provider_runner,
+        token_refresher=lambda provider, account_id, refresh_token: {
+            "access_token": "new-token",
+            "expires_in": 3600,
+        },
+    )
+
+
+def test_provider_auth_headers_for_codex_include_optional_account_id() -> None:
+    headers = build_provider_auth_headers(
+        provider=ProviderId.OPENAI_CODEX,
+        api_key="codex-token",
+        account_id="acct-1",
+    )
+    assert headers["Authorization"] == "Bearer codex-token"
+    assert headers["ChatGPT-Account-Id"] == "acct-1"
+
+
+def test_provider_auth_headers_for_antigravity_accept_json_token_payload() -> None:
+    token, project_id = parse_google_antigravity_api_key(
+        '{"token":"anti-token","projectId":"project-77"}'
+    )
+    assert token == "anti-token"
+    assert project_id == "project-77"
+
+    headers = build_provider_auth_headers(
+        provider=ProviderId.GOOGLE_ANTIGRAVITY,
+        api_key='{"token":"anti-token","projectId":"project-77"}',
+    )
+    assert headers["Authorization"] == "Bearer anti-token"
+
+
+def test_custom_llm_adapter_records_usage_tracker_stats(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("dev_crew.llm.client.time.sleep", lambda _: None)
+
+    store = FileTokenStore(str(tmp_path / "auth-profiles.json"))
+    oauth = OAuthCloneClient(_provider_configs(), store)
+    start = oauth.start_login(ProviderId.OPENAI_CODEX)
+    oauth.complete_login(
+        state=start.state,
+        auth_code="sample-code",
+        token_exchange=lambda **_: {
+            "access_token": "access-token-usage",
+            "expires_in": 3600,
+        },
+    )
+
+    tracker = LLMUsageTracker(window_minutes=60)
+    adapter = CustomLLMAdapter(
+        config=CustomLLMConfig(),
+        token_store=store,
+        logger=EventLogger(),
+        usage_tracker=tracker,
+    )
+
+    attempts = {"count": 0}
+
+    def provider_runner(provider: ProviderId, token: str, model: str, prompt: str) -> str:
+        del provider, token, model, prompt
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RetryableProviderError("retry once")
+        return "ok-output"
+
+    adapter.invoke(
+        LLMRequest(
+            model="codex-mini",
+            prompt="hello usage",
+            metadata={"prompt_tokens": 11},
+        ),
+        provider_runner,
+    )
+
+    snapshot = tracker.snapshot(provider=ProviderId.OPENAI_CODEX, model="codex-mini")
+    assert snapshot["model_count"] == 1
+    row = snapshot["models"][0]
+    assert row["total_calls"] == 2
+    assert row["success_calls"] == 1
+    assert row["error_calls"] == 1
+    assert row["total_prompt_tokens"] == 22
+    assert row["window_calls"] == 2

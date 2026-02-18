@@ -187,6 +187,10 @@ class CrewAIOrchestrator:
         # CrewAI writes internal state under user data dir. In sandboxed runs this path may
         # be unwritable, so redirect HOME into workspace to keep storage local and writable.
         os.environ.setdefault("CREWAI_STORAGE_DIR", "dev_crew")
+        os.environ.setdefault("CREWAI_TRACING_ENABLED", "false")
+        os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+        os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
+        os.environ.setdefault("CREWAI_DISABLE_TRACKING", "true")
         storage_name = os.environ.get("CREWAI_STORAGE_DIR", "dev_crew")
         test_path = Path.home() / "Library" / "Application Support" / storage_name
         try:
@@ -221,6 +225,9 @@ class CrewAIOrchestrator:
 
         default_llm = OfflineEchoLLM()
         agent_llm: Any = self.llm if self.llm else default_llm
+        manager_llm: Any = self.manager_llm if self.manager_llm else agent_llm
+        planning_enabled = bool(self.llm or self.manager_llm)
+        planning_llm: Any = manager_llm if planning_enabled else None
 
         agents_by_role = {
             role: Agent(
@@ -283,7 +290,10 @@ class CrewAIOrchestrator:
             tasks=crew_tasks,
             process=Process.sequential,
             verbose=self.verbose,
-            planning=True,
+            manager_llm=manager_llm,
+            planning=planning_enabled,
+            planning_llm=planning_llm,
+            tracing=False,
         )
         return crew, task_manifest
 

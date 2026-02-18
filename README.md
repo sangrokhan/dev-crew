@@ -8,6 +8,8 @@
 `dev-crew`는 다음을 제공합니다.
 
 - FastAPI 기반 Job API (`/jobs`, `/jobs/{id}`, SSE 이벤트 스트림)
+- LLM 모델 카탈로그 API (`/llm/models`, `/llm/models/refresh`) + 주기 갱신 캐시
+- LLM 사용량 추적 API (`/llm/usage`, `/llm/usage/reset`) + rolling window 집계
 - In-memory queue + worker로 비동기 처리
 - SQLite 기반 Job/Event/Idempotency 저장
 - CrewAI 오케스트레이션 연동 (dry-run 지원)
@@ -45,6 +47,10 @@ export DEV_CREW_DB_PATH=".dev_crew/jobs.db"
 export DEV_CREW_DOCKER_DRY_RUN=1
 export DEV_CREW_USE_CREWAI=1
 export DEV_CREW_CREWAI_DRY_RUN=1
+export DEV_CREW_LOCAL_LLM_MODEL="ollama/llama3.1:8b"
+export DEV_CREW_CREWAI_LLM="$DEV_CREW_LOCAL_LLM_MODEL"
+export DEV_CREW_CREWAI_MANAGER_LLM="$DEV_CREW_LOCAL_LLM_MODEL"
+export DEV_CREW_OLLAMA_BASE_URL="http://127.0.0.1:11434"
 export DEV_CREW_OAUTH_TOKEN_PATH="$HOME/.config/dev_crew/oauth_tokens.json"
 ```
 
@@ -57,6 +63,9 @@ OAuth 진행 중 상태(state/code_verifier)도 같은 위치의 `oauth_tokens.p
 `OAuthCloneClient.refresh_access_token(...)`으로 재발급 후 같은 파일에 갱신 저장합니다.
 `CustomLLMAdapter`는 기본적으로 만료 5분 전(`oauth_refresh_leeway_seconds=300`)부터
 선제적으로 refresh를 시도합니다.
+`openai-codex` 호출에는 access token을 그대로 Bearer 인증으로 사용하고,
+`google-antigravity` 호출에는 OpenClaw와 동일하게
+`{"token":"...","projectId":"..."}` 형식의 토큰 페이로드를 사용합니다.
 
 ### OAuth 로그인 CLI
 
@@ -144,6 +153,34 @@ curl -N "http://localhost:8000/jobs/<job_id>/events"
 curl -s "http://localhost:8000/jobs/<job_id>/escalations"
 ```
 
+### 5) LLM 모델 목록 조회/강제 갱신
+
+```bash
+curl -s "http://localhost:8000/llm/models"
+```
+
+```bash
+curl -s "http://localhost:8000/llm/models?provider=openai-codex&force_refresh=true"
+```
+
+```bash
+curl -s -X POST "http://localhost:8000/llm/models/refresh?provider=google-antigravity"
+```
+
+### 6) LLM 사용량 추적 조회/초기화
+
+```bash
+curl -s "http://localhost:8000/llm/usage"
+```
+
+```bash
+curl -s "http://localhost:8000/llm/usage?provider=openai-codex&model=gpt-5-codex-mini"
+```
+
+```bash
+curl -s -X POST "http://localhost:8000/llm/usage/reset"
+```
+
 ## 테스트
 
 전체 테스트 실행:
@@ -166,8 +203,10 @@ pytest -q tests/test_phase5_api.py
 - `DEV_CREW_DB_PATH` (기본: `.dev_crew/jobs.db`)
 - `DEV_CREW_USE_CREWAI` (기본: `1`)
 - `DEV_CREW_CREWAI_DRY_RUN` (기본: `1`)
-- `DEV_CREW_CREWAI_LLM` (기본: unset)
-- `DEV_CREW_CREWAI_MANAGER_LLM` (기본: unset)
+- `DEV_CREW_LOCAL_LLM_MODEL` (기본: `ollama/llama3.1:8b`)
+- `DEV_CREW_CREWAI_LLM` (기본: `DEV_CREW_LOCAL_LLM_MODEL`)
+- `DEV_CREW_CREWAI_MANAGER_LLM` (기본: `DEV_CREW_CREWAI_LLM`)
+- `DEV_CREW_OLLAMA_BASE_URL` (기본: `http://127.0.0.1:11434`)
 - `DEV_CREW_DOCKER_DRY_RUN` (기본: `1`)
 - `DEV_CREW_DOCKER_TIMEOUT_SECONDS` (기본: `120`)
 - `DEV_CREW_JOB_MAX_STATE_TRANSITIONS` (기본: `20`)
@@ -176,6 +215,13 @@ pytest -q tests/test_phase5_api.py
 - `DEV_CREW_ESCALATION_LOG_PATH` (기본: `.dev_crew/escalations.log`)
 - `DEV_CREW_OAUTH_TOKEN_PATH` (기본: `$HOME/.config/dev_crew/oauth_tokens.json`)
 - `DEV_CREW_OAUTH_ALLOW_WORKSPACE_PATH` (기본: `0`, 테스트/예외 상황에서만 `1`)
+- `DEV_CREW_MODEL_CATALOG_ACCOUNT_ID` (기본: `default`)
+- `DEV_CREW_MODEL_CATALOG_REFRESH_SECONDS` (기본: `600`)
+- `DEV_CREW_MODEL_CATALOG_AUTO_REFRESH` (기본: `1`)
+- `DEV_CREW_MODEL_CATALOG_STARTUP_REFRESH` (기본: `1`)
+- `DEV_CREW_MODEL_CATALOG_HTTP_TIMEOUT_SECONDS` (기본: `10`)
+- `DEV_CREW_CODEX_CLIENT_VERSION` (기본: `0.1.0`)
+- `DEV_CREW_LLM_USAGE_WINDOW_MINUTES` (기본: `60`)
 
 ## 의사결정/구현 이력
 
