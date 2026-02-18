@@ -1,0 +1,87 @@
+# TODO — Dev Crew (CrewAI 기반 상시 개발팀)
+
+## 목표
+- TeamLead(Orchestrator)에게 목표(goal)만 전달하면:
+  - 작업 분해 → 병렬 실행(Spec/Design/QA/Risk) → 취합(Plan) → (승인 게이트) → 구현/테스트 → PR 생성
+- 상시 서비스 형태(API + Queue + Worker)로 운영
+- 모델 인증/라우팅은 CrewAI 포크 없이 Custom LLM + Hooks로 캡슐화
+- Codex로 개발/구현 진행
+
+---
+
+## Phase 0 — 기본 결정
+- [x] GitHub PR 생성 방식 결정: `gh` CLI vs GitHub API
+- [x] 실행 환경 결정: 로컬 워커 vs Docker 샌드박스(권장)
+- [x] 승인 정책 결정: auto / manual(HITL), plan 승인 1회는 권장
+- [x] repo allowlist / base branch 규칙 / 금지 명령 정책 문서화
+
+---
+
+## Phase 1 — 팀 구조(페르소나/역할) 정의
+- [x] agents 정의 (leader 중심 확장형 구조)
+  - [x] leader
+  - [x] architect
+  - [x] frontend
+  - [x] backend
+  - [x] designer
+  - [x] ci/cd engineer
+  - [x] qa engineer
+  - [x] security engineer
+- [x] 산출물 스키마 정의(강제)
+  - [x] Plan 스키마: tasks[], files_to_change[], commands[], test_matrix[], pr_title/body, risks[]
+  - [x] Report 스키마: run summary, links, failures, next actions
+
+---
+
+## Phase 2 — Flow(오케스트레이션) 구현
+- [x] Flow: start(job) → fan-out 병렬 실행 → fan-in 취합 → gate → build → report
+- [x] 재시도 정책
+  - [x] LLM 오류/레이트리밋 백오프
+  - [x] 테스트 실패 시 자동 수정 루프(5회) 후 실패 리포트
+- [x] 상태(State) 모델(Pydantic)로 강제/검증
+
+---
+
+## Phase 3 — Tooling(실제 작업 수행)
+- [x] repo 컨텍스트 수집 도구
+  - [x] 파일/디렉토리 스캔, grep, 주요 모듈 맵 생성
+- [x] git 도구
+  - [x] clone/fetch/checkout/commit/push
+- [x] 테스트/린트 도구
+  - [x] pytest + ruff (+ mypy 선택)
+- [x] PR 생성 도구
+  - [x] gh CLI 기반 또는 GitHub API 기반 구현
+- [x] 권한 분리
+  - [x] 실행 담당 agent만 write 토큰 사용
+  - [x] others는 read-only
+
+---
+
+## Phase 4 — Custom LLM + Hooks(모델 인증/정책/관측)
+- [x] Custom LLM 어댑터 구현
+  - [x] 인증/토큰 주입, 리트라이, 라우팅(Codex/기타)
+- [x] Execution Hooks
+  - [x] 프롬프트/출력 마스킹(시크릿/PII)
+  - [x] 정책 위반 차단(금지 명령/외부 전송 금지)
+  - [x] 관측 로그(LLM call, tool call)
+
+---
+
+## Phase 5 — 상시 운영 API + Queue + Worker
+- [x] FastAPI
+  - [x] POST /jobs (목표 입력)
+  - [x] GET /jobs/{id} (상태 조회)
+  - [x] GET /jobs/{id}/events (SSE/WebSocket 선택)
+- [x] Queue + Worker
+  - [x] In-memory Queue + Worker baseline 구현 (Redis + RQ / Celery 확장 가능 구조)
+- [x] Storage
+  - [x] SQLite(초기) 구현, Postgres(운영) 전환 가능한 구조로 분리
+- [x] Idempotency / 중복 실행 방지
+
+---
+
+## Phase 6 — 운영 안정화
+- [x] Docker 샌드박스(빌드/테스트 격리)
+- [x] 비용/레이트리밋 제어(잡당 상한)
+- [x] 감사 로그(어떤 명령/파일 변경/PR 링크)
+- [x] 실패 시 에스컬레이션(사람 승인/리뷰 요청)
