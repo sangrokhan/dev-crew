@@ -44,7 +44,6 @@ pip install -r requirements.txt
 ```bash
 export DEV_CREW_WORKSPACE_ROOT="$(pwd)"
 export DEV_CREW_DB_PATH=".dev_crew/jobs.db"
-export DEV_CREW_DOCKER_DRY_RUN=1
 export DEV_CREW_USE_CREWAI=1
 export DEV_CREW_CREWAI_DRY_RUN=1
 export DEV_CREW_LOCAL_LLM_MODEL="ollama/llama3.1:8b"
@@ -52,6 +51,7 @@ export DEV_CREW_CREWAI_LLM="$DEV_CREW_LOCAL_LLM_MODEL"
 export DEV_CREW_CREWAI_MANAGER_LLM="$DEV_CREW_LOCAL_LLM_MODEL"
 export DEV_CREW_OLLAMA_BASE_URL="http://127.0.0.1:11434"
 export DEV_CREW_OAUTH_TOKEN_PATH="$HOME/.config/dev_crew/oauth_tokens.json"
+export DEV_CREW_LLM_ACCOUNT_ID="default"
 ```
 
 OAuth 토큰 파일은 기본적으로 워크스페이스 밖(`~/.config/dev_crew/oauth_tokens.json`)에 저장되며,
@@ -66,6 +66,8 @@ OAuth 진행 중 상태(state/code_verifier)도 같은 위치의 `oauth_tokens.p
 `openai-codex` 호출에는 access token을 그대로 Bearer 인증으로 사용하고,
 `google-antigravity` 호출에는 OpenClaw와 동일하게
 `{"token":"...","projectId":"..."}` 형식의 토큰 페이로드를 사용합니다.
+`DEV_CREW_CREWAI_LLM`/`DEV_CREW_CREWAI_MANAGER_LLM`이 `codex*`, `gpt*`, `antigravity*`, `gemini*`
+prefix를 사용하면 CrewAI 에이전트는 `CustomLLMAdapter` 경유 질의 경로를 사용합니다.
 
 ### OAuth 로그인 CLI
 
@@ -206,8 +208,9 @@ pytest -q tests/test_phase5_api.py
 - `DEV_CREW_LOCAL_LLM_MODEL` (기본: `ollama/llama3.1:8b`)
 - `DEV_CREW_CREWAI_LLM` (기본: `DEV_CREW_LOCAL_LLM_MODEL`)
 - `DEV_CREW_CREWAI_MANAGER_LLM` (기본: `DEV_CREW_CREWAI_LLM`)
+- `DEV_CREW_LLM_ACCOUNT_ID` (기본: `default`)
+- `DEV_CREW_LLM_REQUEST_TIMEOUT_SECONDS` (기본: `60`)
 - `DEV_CREW_OLLAMA_BASE_URL` (기본: `http://127.0.0.1:11434`)
-- `DEV_CREW_DOCKER_DRY_RUN` (기본: `1`)
 - `DEV_CREW_DOCKER_TIMEOUT_SECONDS` (기본: `120`)
 - `DEV_CREW_JOB_MAX_STATE_TRANSITIONS` (기본: `20`)
 - `DEV_CREW_JOB_MAX_TOOL_CALLS` (기본: `10`)
@@ -222,6 +225,9 @@ pytest -q tests/test_phase5_api.py
 - `DEV_CREW_MODEL_CATALOG_HTTP_TIMEOUT_SECONDS` (기본: `10`)
 - `DEV_CREW_CODEX_CLIENT_VERSION` (기본: `0.1.0`)
 - `DEV_CREW_LLM_USAGE_WINDOW_MINUTES` (기본: `60`)
+- `DEV_CREW_CODEX_RESPONSES_URL` (기본: `https://chatgpt.com/backend-api/codex/responses`)
+- `DEV_CREW_ANTIGRAVITY_GENERATE_URL` (기본: `https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent`)
+- `DEV_CREW_ANTIGRAVITY_LOAD_CODE_ASSIST_URL` (기본: `https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`)
 
 ## 의사결정/구현 이력
 

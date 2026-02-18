@@ -75,6 +75,8 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 def create_app(db_path: str | None = None) -> FastAPI:
     workspace_root = os.getenv("DEV_CREW_WORKSPACE_ROOT", ".")
+    llm_account_id = _env_text("DEV_CREW_LLM_ACCOUNT_ID") or "default"
+    codex_client_version = _env_text("DEV_CREW_CODEX_CLIENT_VERSION") or "0.1.0"
     store = SqliteJobStore(db_path or _default_db_path())
     queue = InMemoryJobQueue()
     audit_logger = JsonlAuditLogger(_default_audit_log_path())
@@ -88,8 +90,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
             image=os.getenv("DEV_CREW_DOCKER_IMAGE", "python:3.13-slim"),
             workdir=os.getenv("DEV_CREW_DOCKER_WORKDIR", "/workspace"),
             timeout_seconds=int(os.getenv("DEV_CREW_DOCKER_TIMEOUT_SECONDS", "120")),
-            dry_run=os.getenv("DEV_CREW_DOCKER_DRY_RUN", "1") == "1",
         )
+    )
+    token_store = FileTokenStore(
+        path=_env_text("DEV_CREW_OAUTH_TOKEN_PATH"),
+        workspace_root=workspace_root,
+        allow_workspace_path=_env_flag("DEV_CREW_OAUTH_ALLOW_WORKSPACE_PATH", "0"),
+    )
+    usage_tracker = LLMUsageTracker(
+        window_minutes=int(os.getenv("DEV_CREW_LLM_USAGE_WINDOW_MINUTES", "60"))
     )
     service = JobService(
         store=store,
@@ -106,26 +115,25 @@ def create_app(db_path: str | None = None) -> FastAPI:
             llm=_default_crewai_llm(),
             manager_llm=_default_crewai_manager_llm(),
             verbose=os.getenv("DEV_CREW_CREWAI_VERBOSE", "0") == "1",
+            token_store=token_store,
+            usage_tracker=usage_tracker,
+            llm_account_id=llm_account_id,
+            llm_request_timeout_seconds=float(
+                os.getenv("DEV_CREW_LLM_REQUEST_TIMEOUT_SECONDS", "60")
+            ),
+            codex_client_version=codex_client_version,
         ),
-    )
-    token_store = FileTokenStore(
-        path=_env_text("DEV_CREW_OAUTH_TOKEN_PATH"),
-        workspace_root=workspace_root,
-        allow_workspace_path=_env_flag("DEV_CREW_OAUTH_ALLOW_WORKSPACE_PATH", "0"),
     )
     model_catalog = ModelCatalogService(
         token_store=token_store,
-        account_id=_env_text("DEV_CREW_MODEL_CATALOG_ACCOUNT_ID") or "default",
+        account_id=_env_text("DEV_CREW_MODEL_CATALOG_ACCOUNT_ID") or llm_account_id,
         refresh_interval_seconds=int(os.getenv("DEV_CREW_MODEL_CATALOG_REFRESH_SECONDS", "600")),
         request_timeout_seconds=float(
             os.getenv("DEV_CREW_MODEL_CATALOG_HTTP_TIMEOUT_SECONDS", "10")
         ),
-        codex_client_version=_env_text("DEV_CREW_CODEX_CLIENT_VERSION") or "0.1.0",
+        codex_client_version=codex_client_version,
         auto_refresh=_env_flag("DEV_CREW_MODEL_CATALOG_AUTO_REFRESH", "1"),
         startup_refresh=_env_flag("DEV_CREW_MODEL_CATALOG_STARTUP_REFRESH", "1"),
-    )
-    usage_tracker = LLMUsageTracker(
-        window_minutes=int(os.getenv("DEV_CREW_LLM_USAGE_WINDOW_MINUTES", "60"))
     )
 
     @asynccontextmanager
