@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from dev_crew.hooks.observability import EventLogger
+from dev_crew.llm import CustomLLMAdapter, CustomLLMConfig, FileTokenStore, HttpProviderRunner, LLMUsageTracker
+from dev_crew.llm.models import LLMRequest, ProviderId
 from dev_crew.models import JobRecord
+
+ProviderRunner = Callable[[ProviderId, str, str, str], str]
 
 
 class CrewAIExecutionError(RuntimeError):
@@ -34,6 +40,40 @@ class CrewRunResult:
     raw_output: str | None = None
 
 
+def _messages_to_prompt(messages: Any) -> str:
+    if isinstance(messages, str):
+        return messages
+    if not isinstance(messages, list):
+        return str(messages)
+
+    chunks: list[str] = []
+    for row in messages:
+        if not isinstance(row, dict):
+            chunks.append(str(row))
+            continue
+        role = str(row.get("role") or "user").upper()
+        content = _content_to_text(row.get("content"))
+        if content:
+            chunks.append(f"[{role}]\n{content}")
+    return "\n\n".join(chunks)
+
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        pieces = [_content_to_text(item) for item in content]
+        return "\n".join(piece for piece in pieces if piece)
+    if isinstance(content, dict):
+        if "text" in content:
+            return _content_to_text(content.get("text"))
+        if "content" in content:
+            return _content_to_text(content.get("content"))
+        if "parts" in content:
+            return _content_to_text(content.get("parts"))
+    return ""
+
+
 class CrewAIOrchestrator:
     """Declares crew agents/tasks and manages parallel execution via CrewAI."""
 
@@ -46,6 +86,13 @@ class CrewAIOrchestrator:
         llm: str | None = None,
         manager_llm: str | None = None,
         verbose: bool = False,
+        token_store: FileTokenStore | None = None,
+        usage_tracker: LLMUsageTracker | None = None,
+        llm_account_id: str = "default",
+        provider_runner: ProviderRunner | None = None,
+        oauth_refresh_leeway_seconds: int = 0,
+        llm_request_timeout_seconds: float = 60.0,
+        codex_client_version: str = "0.1.0",
     ) -> None:
         self.workspace_root = str(Path(workspace_root).expanduser().resolve())
         self.enabled = enabled
@@ -53,6 +100,25 @@ class CrewAIOrchestrator:
         self.llm = llm
         self.manager_llm = manager_llm
         self.verbose = verbose
+        self.llm_account_id = llm_account_id
+
+        self.token_store = token_store or FileTokenStore(workspace_root=self.workspace_root)
+        self.usage_tracker = usage_tracker
+        self.custom_llm_config = CustomLLMConfig(
+            oauth_refresh_leeway_seconds=oauth_refresh_leeway_seconds
+        )
+        self.custom_llm_logger = EventLogger()
+        self.custom_llm_adapter = CustomLLMAdapter(
+            config=self.custom_llm_config,
+            token_store=self.token_store,
+            logger=self.custom_llm_logger,
+            usage_tracker=self.usage_tracker,
+        )
+        self.provider_runner = provider_runner or HttpProviderRunner(
+            account_id=llm_account_id,
+            request_timeout_seconds=llm_request_timeout_seconds,
+            codex_client_version=codex_client_version,
+        )
 
     def build_plan(self, job: JobRecord) -> CrewPlan:
         roles = [
@@ -223,9 +289,66 @@ class CrewAIOrchestrator:
                     return f"[offline-echo] {messages[:200]}"
                 return "[offline-echo] structured-messages"
 
+        class OAuthAdapterLLM(BaseLLM):
+            def __init__(
+                self,
+                *,
+                model: str,
+                adapter: CustomLLMAdapter,
+                provider_runner: ProviderRunner,
+                account_id: str,
+            ) -> None:
+                super().__init__(model=model, provider="custom-oauth")
+                self._adapter = adapter
+                self._provider_runner = provider_runner
+                self._account_id = account_id
+
+            def call(
+                self,
+                messages: Any,
+                tools: list[dict[str, Any]] | None = None,
+                callbacks: list[Any] | None = None,
+                available_functions: dict[str, Any] | None = None,
+                from_task: Any | None = None,
+                from_agent: Any | None = None,
+                response_model: Any | None = None,
+            ) -> str:
+                del tools, callbacks, available_functions, from_task, from_agent, response_model
+                prompt = _messages_to_prompt(messages)
+                response = self._adapter.invoke(
+                    LLMRequest(model=self.model, prompt=prompt),
+                    self._provider_runner,
+                    account_id=self._account_id,
+                )
+                output = response.output
+                if self.stop:
+                    output = self._apply_stop_words(output)
+                return output
+
+            def supports_function_calling(self) -> bool:
+                return False
+
         default_llm = OfflineEchoLLM()
-        agent_llm: Any = self.llm if self.llm else default_llm
-        manager_llm: Any = self.manager_llm if self.manager_llm else agent_llm
+
+        def _resolve_llm(raw_llm: Any, *, fallback: Any) -> Any:
+            if raw_llm is None:
+                return fallback
+            if not isinstance(raw_llm, str):
+                return raw_llm
+            model = raw_llm.strip()
+            if not model:
+                return fallback
+            if not self._model_uses_custom_adapter(model):
+                return model
+            return OAuthAdapterLLM(
+                model=model,
+                adapter=self.custom_llm_adapter,
+                provider_runner=self.provider_runner,
+                account_id=self.llm_account_id,
+            )
+
+        agent_llm: Any = _resolve_llm(self.llm, fallback=default_llm)
+        manager_llm: Any = _resolve_llm(self.manager_llm, fallback=agent_llm)
         planning_enabled = bool(self.llm or self.manager_llm)
         planning_llm: Any = manager_llm if planning_enabled else None
 
@@ -296,6 +419,13 @@ class CrewAIOrchestrator:
             tracing=False,
         )
         return crew, task_manifest
+
+    def _model_uses_custom_adapter(self, model: str) -> bool:
+        model_lower = model.lower().strip()
+        for prefix in self.custom_llm_config.model_routes:
+            if model_lower.startswith(prefix):
+                return True
+        return False
 
     @staticmethod
     def _workflow_manifest(task_manifest: list[dict[str, Any]]) -> dict[str, Any]:

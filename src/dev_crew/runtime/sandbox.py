@@ -30,7 +30,6 @@ class DockerSandboxConfig:
     image: str = "python:3.13-slim"
     workdir: str = "/workspace"
     timeout_seconds: int = 120
-    dry_run: bool = True
 
 
 class DockerSandboxExecutor:
@@ -57,16 +56,6 @@ class DockerSandboxExecutor:
     def run(self, *, command: list[str], host_workspace: str) -> SandboxResult:
         docker_command = self.build_command(command=command, host_workspace=host_workspace)
         started = time.monotonic()
-
-        if self.config.dry_run:
-            return SandboxResult(
-                command=docker_command,
-                returncode=0,
-                stdout="dry-run",
-                stderr="",
-                duration_ms=int((time.monotonic() - started) * 1000),
-                sandbox="docker",
-            )
 
         process = subprocess.run(
             docker_command,

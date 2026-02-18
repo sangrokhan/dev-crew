@@ -38,7 +38,6 @@ def test_budget_limit_triggers_escalation(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DEV_CREW_ESCALATION_LOG_PATH", str(escalation_log))
     monkeypatch.setenv("DEV_CREW_JOB_MAX_STATE_TRANSITIONS", "2")
     monkeypatch.setenv("DEV_CREW_JOB_MAX_TOOL_CALLS", "10")
-    monkeypatch.setenv("DEV_CREW_DOCKER_DRY_RUN", "1")
 
     app = create_app(str(tmp_path / "jobs.db"))
 
@@ -72,7 +71,6 @@ def test_docker_sandbox_audit_log_written(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DEV_CREW_ESCALATION_LOG_PATH", str(escalation_log))
     monkeypatch.setenv("DEV_CREW_JOB_MAX_STATE_TRANSITIONS", "20")
     monkeypatch.setenv("DEV_CREW_JOB_MAX_TOOL_CALLS", "10")
-    monkeypatch.setenv("DEV_CREW_DOCKER_DRY_RUN", "1")
 
     app = create_app(str(tmp_path / "jobs.db"))
 

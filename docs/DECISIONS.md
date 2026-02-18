@@ -192,7 +192,7 @@
 - 구현 파일:
   - `src/dev_crew/runtime/sandbox.py`
     - Docker sandbox 실행기
-    - 기본 `dry-run` 모드로 안전하게 실행 경로 검증
+    - `docker run` 기반 실제 실행 경로
   - `src/dev_crew/runtime/budget.py`
     - 잡당 상한(`max_state_transitions`, `max_tool_calls`) 강제
   - `src/dev_crew/runtime/audit.py`
@@ -214,7 +214,6 @@
   - `DEV_CREW_DOCKER_IMAGE` (기본: `python:3.13-slim`)
   - `DEV_CREW_DOCKER_WORKDIR` (기본: `/workspace`)
   - `DEV_CREW_DOCKER_TIMEOUT_SECONDS` (기본: `120`)
-  - `DEV_CREW_DOCKER_DRY_RUN` (기본: `1`)
   - `DEV_CREW_AUDIT_LOG_PATH` (기본: `.dev_crew/audit.log`)
   - `DEV_CREW_ESCALATION_LOG_PATH` (기본: `.dev_crew/escalations.log`)
 

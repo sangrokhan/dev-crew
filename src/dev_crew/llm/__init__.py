@@ -16,6 +16,7 @@ from .models import (
 )
 from .oauth_clone import OAuthCloneClient, OAuthFlowError
 from .provider_auth import build_provider_auth_headers, parse_google_antigravity_api_key
+from .provider_runner import HttpProviderRunner
 from .router import ProviderRouter
 from .token_store import FileTokenStore, default_oauth_token_path
 from .usage_tracker import LLMUsageTracker
@@ -39,6 +40,7 @@ __all__ = [
     "OAuthStart",
     "ProviderId",
     "build_provider_auth_headers",
+    "HttpProviderRunner",
     "parse_google_antigravity_api_key",
     "ProviderRouter",
     "RetryableProviderError",
