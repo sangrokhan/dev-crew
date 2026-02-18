@@ -1,215 +1,146 @@
 # dev-crew
-personalized dev crew
 
-## Phase 0 결정사항 (2026-02-18)
+로컬에서 실행 가능한 멀티 에이전트 개발 오케스트레이션 API입니다.
+`job`을 생성하면 상태 전이를 거치며 계획/실행/리포트 흐름을 처리합니다.
 
-- PR 생성 방식: `gh` CLI 사용
-- 실행 환경: 잡(Job) 단위 Docker 컨테이너 1개
-- 승인 정책: `manual(HITL)` + Plan 1회 승인 게이트
-- 저장소 정책:
-  - repo allowlist는 고정 단일 저장소가 아니라, 작업(Job) 생성 시 명시된 대상 repo 기준으로 적용
-  - 로컬 병렬 작업은 `git worktree` 기반으로 분리 실행
-- 브랜치 정책:
-  - base branch는 `main` 대상
-  - 작업 브랜치는 `crew/*` 패턴으로 생성
-- 금지 명령 정책:
-  - `git reset --hard`
-  - `git clean -fd`
-  - 무단 `rm -rf`
-  - 보호 브랜치 강제 push
+## 소개
 
-## Phase 1 에이전트 구조 결정 (2026-02-18)
+`dev-crew`는 다음을 제공합니다.
 
-- 기본 운영 모델: `leader` 1명 아래에 역할별 에이전트를 두는 확장형 구조
-- 원칙:
-  - 초기 역할에 제한되지 않으며, 작업 성격에 따라 에이전트 추가 가능
-  - 각 에이전트는 명확한 책임 경계를 가지되 협업은 leader가 오케스트레이션
-- 초기 에이전트 구성:
-  - `leader`
-  - `architect`
-  - `frontend`
-  - `backend`
-  - `designer`
-  - `ci/cd engineer`
-  - `qa engineer`
-  - `security engineer`
+- FastAPI 기반 Job API (`/jobs`, `/jobs/{id}`, SSE 이벤트 스트림)
+- In-memory queue + worker로 비동기 처리
+- SQLite 기반 Job/Event/Idempotency 저장
+- CrewAI 오케스트레이션 연동 (dry-run 지원)
+- Docker sandbox 실행기, budget 가드, 감사/에스컬레이션 로그
 
-## Phase 1 산출물 스키마 결정 (v1, 2026-02-18)
+## 요구사항
 
-- 원칙:
-  - 현재 개발 속도를 위해 최소 필수 필드 중심으로 고정
-  - 운영 중 필요 시 하위 호환 방식으로 확장
+- Python 3.11+
+- `pip`
+- (선택) Docker: sandbox 실제 실행 시 필요
+- (선택) `gh` CLI: PR 자동화 확장 시 필요
 
-- Plan 스키마(v1):
-  - `tasks[]`
-    - `id`: string
-    - `title`: string
-    - `owner_agent`: string
-    - `depends_on`: string[]
-    - `acceptance_criteria`: string[]
-  - `files_to_change`: string[]
-  - `commands`: string[]
-  - `test_matrix`: string[]
-  - `pr`
-    - `title`: string
-    - `body`: string
-  - `risks`: string[]
-  - `approvals`
-    - `requires_plan_approval`: boolean (`true`)
+## 환경설정
 
-- Report 스키마(v1):
-  - `run_summary`: string
-  - `links`: string[]
-  - `failures`: string[]
-  - `next_actions`: string[]
+### 1) 가상환경 생성
 
-## Phase 2 재시도 정책 결정 (2026-02-18)
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
 
-- 테스트 실패 시 자동 수정 루프 기본값: `최대 5회`
-- LLM 호출 재시도:
-  - 대상: `429`, `5xx`
-  - 횟수: `최대 5회`
-  - 백오프: `1s -> 2s -> 4s -> 8s -> 16s`, `max 32s`, jitter 적용
-  - 타임아웃: 호출당 `60s`, 누적(대기+실행) `120s`
-- 레이트 리밋:
-  - job 단위: `30 req/min`
-  - 시스템 전체: `120 req/min`
-  - burst: `10`
-- 비재시도 조건:
-  - 정책 위반(금지 명령 등)
-  - 승인 거절
-  - 명백한 요구사항 충돌
+### 2) 의존성 설치
 
-## Phase 2 구현 상태 (v1, 2026-02-18)
+```bash
+pip install -r requirements.txt
+```
 
-- 구현 파일:
-  - `src/dev_crew/models.py`
-    - Job 상태 전이 모델(`JobState`, `ALLOWED_STATE_TRANSITIONS`)
-    - 정책 모델(`RetryPolicy`, `RateLimitPolicy`)
-    - 산출물 모델(`PlanV1`, `ReportV1`)
-  - `src/dev_crew/flow.py`
-    - 오케스트레이션 러너(`JobRunner`): `start -> planning -> gate -> build -> report`
-    - 자동 수정 루프(`auto_fix_max_rounds=5`) 반영
-  - `tests/test_phase2_flow.py`
-    - 상태 전이 검증
-    - 자동 수정 5회 루프 검증
-    - 승인 거절 시 실패 상태 검증
+### 3) 기본 환경변수(선택)
 
-## CrewAI 오케스트레이션 업데이트 (2026-02-18)
+기본값으로도 실행 가능하지만, 필요 시 아래를 설정하세요.
 
-- 핵심 변경:
-  - `JobService`가 자체 fan-out 문구만 사용하는 방식에서, `CrewAIOrchestrator` 기반 선언/실행으로 전환
-  - 역할별 specialist task는 `async_execution=True`로 병렬 실행 관리
-  - `leader` task는 specialist 결과를 컨텍스트로 받아 최종 취합
+```bash
+export DEV_CREW_WORKSPACE_ROOT="$(pwd)"
+export DEV_CREW_DB_PATH=".dev_crew/jobs.db"
+export DEV_CREW_DOCKER_DRY_RUN=1
+export DEV_CREW_USE_CREWAI=1
+export DEV_CREW_CREWAI_DRY_RUN=1
+```
 
-- 구현 파일:
-  - `src/dev_crew/orchestration/crewai_runner.py`
-  - `src/dev_crew/orchestration/__init__.py`
-  - `src/dev_crew/services/jobs.py`
-  - `src/dev_crew/api/app.py`
-  - `tests/test_crewai_orchestration.py`
+## 실행 방법
 
-- 운영 환경변수:
-  - `DEV_CREW_USE_CREWAI` (기본: `1`)
-  - `DEV_CREW_CREWAI_DRY_RUN` (기본: `1`)
-  - `DEV_CREW_CREWAI_LLM` (기본: unset, 오프라인 echo LLM 사용)
-  - `DEV_CREW_CREWAI_MANAGER_LLM` (기본: unset)
-  - `DEV_CREW_CREWAI_VERBOSE` (기본: `0`)
+프로젝트 루트에서 실행:
 
-## Phase 3 구현 상태 (v1, 2026-02-18)
+```bash
+PYTHONPATH=src uvicorn dev_crew.api.app:app --reload --host 0.0.0.0 --port 8000
+```
 
-- 구현 파일:
-  - `src/dev_crew/tools/context.py`
-    - repo 파일/디렉토리 스캔
-    - `rg` 기반 검색(`grep_repo`)
-    - 상위 모듈 맵 생성
-  - `src/dev_crew/tools/git_ops.py`
-    - `clone/fetch/checkout/worktree/commit/push` 래퍼
-  - `src/dev_crew/tools/quality.py`
-    - `pytest`, `ruff`, `mypy` 실행 래퍼
-  - `src/dev_crew/tools/pr_gh.py`
-    - `gh pr create` 래퍼
-  - `src/dev_crew/security/permissions.py`
-    - 실행 담당 agent만 `write`, 나머지 `read-only` 정책
-  - `tests/test_phase3_tooling.py`
-    - 컨텍스트 수집/grep 동작 검증
-    - 권한 분리 정책 검증
+서버 확인:
 
-## Phase 4 구현 상태 (v1, 2026-02-18)
+```bash
+curl -s http://localhost:8000/docs | head
+```
 
-- 구현 방식:
-  - OpenClaw 흐름을 참조한 복제형(Custom) OAuth 계층 구성
-  - 초기 대상 provider: `openai-codex`, `google-antigravity`
+## 사용법
 
-- 구현 파일:
-  - `src/dev_crew/llm/models.py`
-    - provider/요청/응답/OAuth 모델
-  - `src/dev_crew/llm/token_store.py`
-    - 파일 기반 auth profile 저장소
-  - `src/dev_crew/llm/oauth_clone.py`
-    - PKCE 기반 OAuth 시작/완료 플로우
-  - `src/dev_crew/llm/router.py`
-    - model prefix 기반 provider 라우팅
-  - `src/dev_crew/llm/client.py`
-    - Custom LLM 어댑터(프로필 조회, 정책 훅, 재시도, 관측 로그 연동)
-  - `src/dev_crew/hooks/security.py`
-    - 프롬프트/출력 마스킹(시크릿/PII)
-    - 정책 위반 명령 차단(금지 명령)
-  - `src/dev_crew/hooks/observability.py`
-    - LLM/tool 호출 이벤트 로깅
-  - `tests/test_phase4_custom_llm.py`
-    - OAuth clone flow / 라우팅 / 정책 훅 / 재시도 검증
+### 1) Job 생성
 
-## Phase 5 구현 상태 (v1, 2026-02-18)
+```bash
+curl -s -X POST "http://localhost:8000/jobs" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: demo-job-001" \
+  -d '{
+    "goal": "Implement API endpoint",
+    "repo": "org/repo",
+    "base_branch": "main"
+  }'
+```
 
-- 구현 파일:
-  - `src/dev_crew/api/app.py`
-    - `POST /jobs`
-    - `GET /jobs/{id}`
-    - `GET /jobs/{id}/events` (SSE)
-  - `src/dev_crew/api/schemas.py`
-    - API 요청/응답 스키마
-  - `src/dev_crew/services/jobs.py`
-    - Job 생성/조회/처리 서비스
-    - idempotency key 충돌/재사용 처리
-  - `src/dev_crew/storage/sqlite.py`
-    - SQLite 기반 Job/Event/Idempotency 저장소
-  - `src/dev_crew/queue/in_memory.py`
-    - 비동기 Queue + Worker 실행기
-  - `tests/test_phase5_api.py`
-    - API 흐름/Idempotency/SSE 테스트
+### 2) Job 상태 조회
 
-- Storage 전략:
-  - 현재: SQLite (`.dev_crew/jobs.db`)
-  - 전환 계획: 저장소 인터페이스 유지 후 Postgres backend 추가로 대체 가능
+```bash
+curl -s "http://localhost:8000/jobs/<job_id>"
+```
 
-## Phase 6 구현 상태 (v1, 2026-02-18)
+### 3) 이벤트 스트림(SSE)
 
-- 구현 파일:
-  - `src/dev_crew/runtime/sandbox.py`
-    - Docker sandbox 실행기
-    - 기본 `dry-run` 모드로 안전하게 실행 경로 검증
-  - `src/dev_crew/runtime/budget.py`
-    - 잡당 상한(`max_state_transitions`, `max_tool_calls`) 강제
-  - `src/dev_crew/runtime/audit.py`
-    - JSONL 감사 로그 기록(`job`, `state_transition`, `tool_call`, `escalation`)
-  - `src/dev_crew/runtime/escalation.py`
-    - 실패 시 에스컬레이션 레코드 생성
-  - `src/dev_crew/services/jobs.py`
-    - budget 체크 + sandbox 실행 + 감사 로그 + 실패 에스컬레이션 통합
-  - `src/dev_crew/api/app.py`
-    - 환경변수 기반 안정화 설정 주입
-    - `GET /jobs/{id}/escalations` 추가
-  - `tests/test_phase6_stability.py`
-    - budget 초과 시 실패/에스컬레이션 검증
-    - sandbox 호출 감사 로그 검증
+```bash
+curl -N "http://localhost:8000/jobs/<job_id>/events"
+```
 
-- 운영 설정(환경변수):
-  - `DEV_CREW_JOB_MAX_STATE_TRANSITIONS` (기본: `20`)
-  - `DEV_CREW_JOB_MAX_TOOL_CALLS` (기본: `10`)
-  - `DEV_CREW_DOCKER_IMAGE` (기본: `python:3.13-slim`)
-  - `DEV_CREW_DOCKER_WORKDIR` (기본: `/workspace`)
-  - `DEV_CREW_DOCKER_TIMEOUT_SECONDS` (기본: `120`)
-  - `DEV_CREW_DOCKER_DRY_RUN` (기본: `1`)
-  - `DEV_CREW_AUDIT_LOG_PATH` (기본: `.dev_crew/audit.log`)
-  - `DEV_CREW_ESCALATION_LOG_PATH` (기본: `.dev_crew/escalations.log`)
+### 4) 에스컬레이션 조회
+
+```bash
+curl -s "http://localhost:8000/jobs/<job_id>/escalations"
+```
+
+## 테스트
+
+전체 테스트 실행:
+
+```bash
+pytest -q
+```
+
+특정 테스트만 실행:
+
+```bash
+pytest -q tests/test_phase5_api.py
+```
+
+## 주요 설정값
+
+자주 쓰는 환경변수만 정리했습니다.
+
+- `DEV_CREW_WORKSPACE_ROOT` (기본: `.`)
+- `DEV_CREW_DB_PATH` (기본: `.dev_crew/jobs.db`)
+- `DEV_CREW_USE_CREWAI` (기본: `1`)
+- `DEV_CREW_CREWAI_DRY_RUN` (기본: `1`)
+- `DEV_CREW_CREWAI_LLM` (기본: unset)
+- `DEV_CREW_CREWAI_MANAGER_LLM` (기본: unset)
+- `DEV_CREW_DOCKER_DRY_RUN` (기본: `1`)
+- `DEV_CREW_DOCKER_TIMEOUT_SECONDS` (기본: `120`)
+- `DEV_CREW_JOB_MAX_STATE_TRANSITIONS` (기본: `20`)
+- `DEV_CREW_JOB_MAX_TOOL_CALLS` (기본: `10`)
+- `DEV_CREW_AUDIT_LOG_PATH` (기본: `.dev_crew/audit.log`)
+- `DEV_CREW_ESCALATION_LOG_PATH` (기본: `.dev_crew/escalations.log`)
+
+## 의사결정/구현 이력
+
+기존 결정사항과 단계별 구현 기록은 아래 문서로 분리했습니다.
+
+- `docs/DECISIONS.md`
+
+## 프로젝트 구조
+
+```text
+src/dev_crew/
+  api/             # FastAPI 엔드포인트
+  services/        # Job 서비스 레이어
+  orchestration/   # CrewAI 오케스트레이션
+  runtime/         # sandbox / budget / audit / escalation
+  storage/         # SQLite 저장소
+  queue/           # in-memory queue
+  tools/           # context/git/quality/pr 래퍼
+tests/             # 단위/통합 테스트
+```
