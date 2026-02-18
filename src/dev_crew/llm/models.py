@@ -34,11 +34,16 @@ class OAuthToken(BaseModel):
         return datetime.now(timezone.utc) >= self.expires_at
 
     @classmethod
-    def from_token_response(cls, payload: dict[str, Any]) -> "OAuthToken":
+    def from_token_response(
+        cls,
+        payload: dict[str, Any],
+        *,
+        previous_refresh_token: str | None = None,
+    ) -> "OAuthToken":
         expires_in = int(payload.get("expires_in", 3600))
         return cls(
             access_token=payload["access_token"],
-            refresh_token=payload.get("refresh_token"),
+            refresh_token=payload.get("refresh_token", previous_refresh_token),
             token_type=payload.get("token_type", "Bearer"),
             expires_at=datetime.now(timezone.utc) + timedelta(seconds=expires_in),
             scope=payload.get("scope"),
@@ -77,6 +82,7 @@ class CustomLLMConfig(BaseModel):
     )
     llm_max_attempts: int = 5
     llm_backoff_schedule_seconds: list[int] = Field(default_factory=lambda: [1, 2, 4, 8, 16])
+    oauth_refresh_leeway_seconds: int = 300
 
     @model_validator(mode="after")
     def validate_retry_config(self) -> "CustomLLMConfig":
@@ -86,6 +92,8 @@ class CustomLLMConfig(BaseModel):
             raise ValueError("llm_backoff_schedule_seconds must not be empty")
         if any(v <= 0 for v in self.llm_backoff_schedule_seconds):
             raise ValueError("llm_backoff_schedule_seconds must be positive")
+        if self.oauth_refresh_leeway_seconds < 0:
+            raise ValueError("oauth_refresh_leeway_seconds must be >= 0")
         return self
 
 

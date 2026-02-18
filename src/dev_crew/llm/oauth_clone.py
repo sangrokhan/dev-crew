@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import secrets
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
 from urllib.parse import urlencode
 
 from .models import OAuthProfile, OAuthProviderConfig, OAuthStart, OAuthToken, ProviderId
@@ -46,10 +49,23 @@ class OAuthCloneClient:
         self,
         provider_configs: dict[ProviderId, OAuthProviderConfig],
         token_store: FileTokenStore,
+        pending_store_path: str | None = None,
     ) -> None:
         self.provider_configs = provider_configs
         self.token_store = token_store
-        self.pending: dict[str, PendingAuthSession] = {}
+        self.pending_store_path = (
+            Path(pending_store_path).expanduser().resolve()
+            if pending_store_path
+            else self.token_store.path.with_name(
+                f"{self.token_store.path.stem}.pending{self.token_store.path.suffix}"
+            )
+        )
+        self.pending_store_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.pending_store_path.parent.chmod(0o700)
+        except Exception:
+            pass
+        self.pending: dict[str, PendingAuthSession] = self._load_pending()
 
     def start_login(self, provider: ProviderId, account_id: str = "default") -> OAuthStart:
         config = self.provider_configs.get(provider)
@@ -78,6 +94,7 @@ class OAuthCloneClient:
             state=state,
             code_verifier=code_verifier,
         )
+        self._save_pending()
         return OAuthStart(
             provider=provider,
             state=state,
@@ -91,7 +108,7 @@ class OAuthCloneClient:
         *,
         state: str,
         auth_code: str,
-        token_exchange,
+        token_exchange: Callable[..., dict[str, Any]],
     ) -> OAuthProfile:
         session = self.pending.get(state)
         if not session:
@@ -111,4 +128,78 @@ class OAuthCloneClient:
         )
         self.token_store.save_profile(profile)
         del self.pending[state]
+        self._save_pending()
         return profile
+
+    def refresh_access_token(
+        self,
+        *,
+        provider: ProviderId,
+        account_id: str = "default",
+        token_refresh: Callable[..., dict[str, Any]],
+    ) -> OAuthProfile:
+        profile = self.token_store.load_profile(provider, account_id=account_id)
+        if not profile:
+            raise OAuthFlowError(
+                f"OAuth profile not found for provider={provider.value}, account_id={account_id}"
+            )
+        if not profile.token.refresh_token:
+            raise OAuthFlowError(
+                f"refresh token not found for provider={provider.value}, account_id={account_id}"
+            )
+
+        provider_config = self.provider_configs.get(provider)
+        if not provider_config:
+            raise OAuthFlowError(f"provider config not found: {provider.value}")
+
+        token_payload = token_refresh(
+            provider_config=provider_config,
+            refresh_token=profile.token.refresh_token,
+        )
+        token = OAuthToken.from_token_response(
+            token_payload,
+            previous_refresh_token=profile.token.refresh_token,
+        )
+        refreshed = OAuthProfile(
+            provider=provider,
+            account_id=account_id,
+            token=token,
+        )
+        self.token_store.save_profile(refreshed)
+        return refreshed
+
+    def _load_pending(self) -> dict[str, PendingAuthSession]:
+        if not self.pending_store_path.exists():
+            return {}
+        raw = self.pending_store_path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        sessions: dict[str, PendingAuthSession] = {}
+        for state, payload in data.items():
+            sessions[state] = PendingAuthSession(
+                provider=ProviderId(payload["provider"]),
+                account_id=payload["account_id"],
+                state=payload["state"],
+                code_verifier=payload["code_verifier"],
+            )
+        return sessions
+
+    def _save_pending(self) -> None:
+        serialized = {
+            state: {
+                "provider": session.provider.value,
+                "account_id": session.account_id,
+                "state": session.state,
+                "code_verifier": session.code_verifier,
+            }
+            for state, session in self.pending.items()
+        }
+        self.pending_store_path.write_text(
+            json.dumps(serialized, ensure_ascii=True, indent=2),
+            encoding="utf-8",
+        )
+        try:
+            self.pending_store_path.chmod(0o600)
+        except Exception:
+            pass

@@ -11,11 +11,12 @@ from .models import (
 )
 from .oauth_clone import OAuthCloneClient, OAuthFlowError
 from .router import ProviderRouter
-from .token_store import FileTokenStore
+from .token_store import FileTokenStore, default_oauth_token_path
 
 __all__ = [
     "CustomLLMAdapter",
     "CustomLLMConfig",
+    "default_oauth_token_path",
     "FileTokenStore",
     "LLMRequest",
     "LLMResponse",
