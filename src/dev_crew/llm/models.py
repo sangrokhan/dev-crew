@@ -29,6 +29,7 @@ class OAuthToken(BaseModel):
     token_type: str = "Bearer"
     expires_at: datetime
     scope: str | None = None
+    project_id: str | None = None
 
     @property
     def is_expired(self) -> bool:
@@ -40,14 +41,17 @@ class OAuthToken(BaseModel):
         payload: dict[str, Any],
         *,
         previous_refresh_token: str | None = None,
+        previous_project_id: str | None = None,
     ) -> "OAuthToken":
         expires_in = int(payload.get("expires_in", 3600))
+        project_id = payload.get("project_id") or payload.get("projectId") or previous_project_id
         return cls(
             access_token=payload["access_token"],
             refresh_token=payload.get("refresh_token", previous_refresh_token),
             token_type=payload.get("token_type", "Bearer"),
             expires_at=datetime.now(timezone.utc) + timedelta(seconds=expires_in),
             scope=payload.get("scope"),
+            project_id=project_id,
         )
 
 
@@ -69,6 +73,42 @@ class LLMResponse(BaseModel):
     model: str
     output: str
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class LLMUsageWindow(BaseModel):
+    label: str
+    used_percent: float
+    reset_at: datetime | None = None
+
+
+class LLMUsageSummary(BaseModel):
+    plan: str | None = None
+    windows: list[LLMUsageWindow] = Field(default_factory=list)
+
+
+class LLMModelInfo(BaseModel):
+    provider: ProviderId
+    model_id: str
+    display_name: str | None = None
+    usage_hint: str = "balanced"
+    priority: int = 50
+    context_window_tokens: int | None = None
+    max_output_tokens: int | None = None
+    quota_remaining_fraction: float | None = None
+    quota_reset_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class LLMProviderCatalog(BaseModel):
+    provider: ProviderId
+    account_id: str = "default"
+    model_count: int = 0
+    last_refresh_at: datetime | None = None
+    last_success_at: datetime | None = None
+    next_refresh_at: datetime | None = None
+    stale: bool = False
+    last_error: str | None = None
+    usage: LLMUsageSummary | None = None
 
 
 class CustomLLMConfig(BaseModel):

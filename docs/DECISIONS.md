@@ -114,8 +114,10 @@
 - 운영 환경변수:
   - `DEV_CREW_USE_CREWAI` (기본: `1`)
   - `DEV_CREW_CREWAI_DRY_RUN` (기본: `1`)
-  - `DEV_CREW_CREWAI_LLM` (기본: unset, 오프라인 echo LLM 사용)
-  - `DEV_CREW_CREWAI_MANAGER_LLM` (기본: unset)
+  - `DEV_CREW_LOCAL_LLM_MODEL` (기본: `ollama/llama3.1:8b`)
+  - `DEV_CREW_CREWAI_LLM` (기본: `DEV_CREW_LOCAL_LLM_MODEL`)
+  - `DEV_CREW_CREWAI_MANAGER_LLM` (기본: `DEV_CREW_CREWAI_LLM`)
+  - `DEV_CREW_OLLAMA_BASE_URL` (기본: `http://127.0.0.1:11434`)
   - `DEV_CREW_CREWAI_VERBOSE` (기본: `0`)
 
 ## Phase 3 구현 상태 (v1, 2026-02-18)
@@ -215,3 +217,61 @@
   - `DEV_CREW_DOCKER_DRY_RUN` (기본: `1`)
   - `DEV_CREW_AUDIT_LOG_PATH` (기본: `.dev_crew/audit.log`)
   - `DEV_CREW_ESCALATION_LOG_PATH` (기본: `.dev_crew/escalations.log`)
+
+## Phase 7 구현 상태 (v1, 2026-02-18)
+
+- 목표:
+  - provider별 모델 리스트를 조회하고, 용도/우선순위/토큰 사용 상태를 함께 제공
+  - 주기적 refresh 캐시를 API 서버 수명주기와 연동
+
+- 구현 파일:
+  - `src/dev_crew/llm/model_catalog.py`
+    - Codex 모델 목록 + 사용량(`wham/usage`) 조회
+    - Antigravity 모델 목록(`fetchAvailableModels`) + 사용량(`loadCodeAssist`) 조회
+    - provider별 캐시/오류 상태/주기 refresh 루프
+  - `src/dev_crew/llm/models.py`
+    - 모델/사용량/카탈로그 응답 모델 추가
+  - `src/dev_crew/api/schemas.py`
+    - `/llm/models` 응답 스키마 추가
+  - `src/dev_crew/api/app.py`
+    - `GET /llm/models`
+    - `POST /llm/models/refresh`
+    - 앱 startup/shutdown 시 model catalog start/stop 연동
+  - `tests/test_phase7_model_catalog.py`
+    - mock transport 기반 provider 응답 파싱 테스트
+    - 주기 refresh 동작 테스트
+    - API 엔드포인트 테스트
+
+- 운영 설정(환경변수):
+  - `DEV_CREW_MODEL_CATALOG_ACCOUNT_ID` (기본: `default`)
+  - `DEV_CREW_MODEL_CATALOG_REFRESH_SECONDS` (기본: `600`)
+  - `DEV_CREW_MODEL_CATALOG_AUTO_REFRESH` (기본: `1`)
+  - `DEV_CREW_MODEL_CATALOG_STARTUP_REFRESH` (기본: `1`)
+  - `DEV_CREW_MODEL_CATALOG_HTTP_TIMEOUT_SECONDS` (기본: `10`)
+  - `DEV_CREW_CODEX_CLIENT_VERSION` (기본: `0.1.0`)
+
+## Phase 8 구현 상태 (v1, 2026-02-18)
+
+- 목표:
+  - LLM 호출량/토큰 사용량을 모델 단위로 추적해 모델 선택 정책에 활용
+  - 누적(total) + 최근 구간(rolling window) 사용량 동시 제공
+
+- 구현 파일:
+  - `src/dev_crew/llm/usage_tracker.py`
+    - provider/model별 호출/성공/실패 카운트 집계
+    - prompt/completion token 집계(제공값 우선, 미제공 시 경량 추정)
+    - rolling window 이벤트 관리 및 snapshot API 데이터 생성
+  - `src/dev_crew/llm/client.py`
+    - `CustomLLMAdapter` 호출 성공/실패 시 usage tracker 기록 연동
+  - `src/dev_crew/api/app.py`
+    - `GET /llm/usage`
+    - `POST /llm/usage/reset`
+  - `src/dev_crew/api/schemas.py`
+    - usage 추적 응답 스키마 추가
+  - `tests/test_phase8_usage_tracking.py`
+    - rolling window prune + API endpoint 테스트
+  - `tests/test_phase4_custom_llm.py`
+    - adapter usage tracker 기록 테스트 추가
+
+- 운영 설정(환경변수):
+  - `DEV_CREW_LLM_USAGE_WINDOW_MINUTES` (기본: `60`)

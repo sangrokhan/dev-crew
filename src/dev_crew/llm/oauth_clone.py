@@ -160,6 +160,7 @@ class OAuthCloneClient:
         token = OAuthToken.from_token_response(
             token_payload,
             previous_refresh_token=profile.token.refresh_token,
+            previous_project_id=profile.token.project_id,
         )
         refreshed = OAuthProfile(
             provider=provider,
