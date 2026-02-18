@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from dev_crew.models import JobEvent, JobRecord, JobState
 from dev_crew.orchestration import CrewAIOrchestrator
@@ -103,7 +104,19 @@ class JobService:
                     at=datetime.now(timezone.utc),
                     state=JobState.RECEIVED,
                     message="Job created",
-                    metadata={"idempotency_key": idempotency_key or ""},
+                    metadata={
+                        "idempotency_key": idempotency_key or "",
+                        "event_type": "workflow_step",
+                        "step": "request",
+                        "phase": "received",
+                        "call_order": 1,
+                        "details": {
+                            "goal": goal,
+                            "repo": repo,
+                            "base_branch": base_branch,
+                            "work_branch": work_branch,
+                        },
+                    },
                 )
             ],
         )
@@ -117,6 +130,22 @@ class JobService:
                 "repo": repo,
                 "base_branch": base_branch,
                 "work_branch": work_branch,
+            },
+        )
+        self.audit_logger.log(
+            job_id=job.job_id,
+            category="workflow",
+            action="request:received",
+            metadata={
+                "step": "request",
+                "phase": "received",
+                "call_order": 1,
+                "details": {
+                    "goal": goal,
+                    "repo": repo,
+                    "base_branch": base_branch,
+                    "work_branch": work_branch,
+                },
             },
         )
 
@@ -165,7 +194,10 @@ class JobService:
         if job.current_state in TERMINAL_STATES:
             return
 
-        budget_guard = JobBudgetGuard(self.budget_config, initial_transitions=len(job.history))
+        budget_guard = JobBudgetGuard(
+            self.budget_config,
+            initial_transitions=self._count_state_transitions(job),
+        )
 
         try:
             await self._advance(
@@ -174,7 +206,34 @@ class JobService:
                 "Collecting repository context",
                 budget_guard=budget_guard,
             )
+            self._record_workflow_step(
+                job,
+                step="pan_out",
+                phase="started",
+                message="Fan-out started for specialist agents",
+            )
             crew_result = self.orchestrator.run(job)
+            self._record_workflow_step(
+                job,
+                step="pan_out",
+                phase="completed",
+                message="Fan-out completed for specialist agents",
+                details={
+                    "roles": crew_result.metadata.get("workflow", {}).get("pan_out_roles", []),
+                    "task_count": len(crew_result.metadata.get("tasks", [])),
+                },
+            )
+            self._record_agent_decisions(job, crew_result.metadata)
+            self._record_workflow_step(
+                job,
+                step="pan_in",
+                phase="completed",
+                message="Leader pan-in synthesis completed",
+                details={
+                    "roles": crew_result.metadata.get("workflow", {}).get("pan_in_roles", []),
+                    "summary": crew_result.summary,
+                },
+            )
             await self._advance(
                 job,
                 JobState.PLANNING,
@@ -184,6 +243,13 @@ class JobService:
                     "crewai_summary": crew_result.summary,
                     "crewai": crew_result.metadata,
                 },
+            )
+            self._record_workflow_step(
+                job,
+                step="aggregation",
+                phase="completed",
+                message="Specialist outputs aggregated into plan context",
+                details={"crewai_summary": crew_result.summary},
             )
             self.audit_logger.log(
                 job_id=job.job_id,
@@ -220,7 +286,28 @@ class JobService:
                 "Job completed",
                 budget_guard=budget_guard,
             )
+            self._record_workflow_step(
+                job,
+                step="final_conclusion",
+                phase="completed",
+                message="Final conclusion recorded",
+                details={"result": "completed"},
+            )
         except Exception as exc:
+            try:
+                self._record_workflow_step(
+                    job,
+                    step="final_conclusion",
+                    phase="failed",
+                    message="Final conclusion recorded",
+                    details={
+                        "result": "failed",
+                        "error": str(exc),
+                        "failed_state": job.current_state.value,
+                    },
+                )
+            except Exception:
+                pass
             escalation = self.escalation_manager.create(
                 job_id=job.job_id,
                 severity="high",
@@ -263,6 +350,17 @@ class JobService:
                 "target_repo": job.repo,
             },
         )
+        self._record_workflow_step(
+            job,
+            step="execution",
+            phase="completed" if sandbox_result.returncode == 0 else "failed",
+            message="Sandbox test execution finished",
+            details={
+                "command": sandbox_result.command,
+                "returncode": sandbox_result.returncode,
+                "duration_ms": sandbox_result.duration_ms,
+            },
+        )
         await asyncio.sleep(0)
 
     async def _advance(
@@ -277,7 +375,16 @@ class JobService:
         if enforce_budget:
             budget_guard.consume_transition()
         previous_state = job.current_state
-        job.transition_to(state, message, metadata=metadata)
+        call_order = len(job.history) + 1
+        enriched_metadata: dict[str, Any] = {
+            "event_type": "state_transition",
+            "from_state": previous_state.value,
+            "to_state": state.value,
+            "call_order": call_order,
+        }
+        if metadata:
+            enriched_metadata.update(metadata)
+        job.transition_to(state, message, metadata=enriched_metadata)
         event = job.history[-1]
         self.store.append_event(job.job_id, event)
         self.audit_logger.log(
@@ -286,10 +393,91 @@ class JobService:
             action=f"{previous_state.value}->{state.value}",
             metadata={
                 "message": message,
-                "metadata": metadata or {},
+                "metadata": event.metadata,
             },
         )
         await asyncio.sleep(0)
+
+    def _record_workflow_step(
+        self,
+        job: JobRecord,
+        *,
+        step: str,
+        phase: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        call_order = len(job.history) + 1
+        metadata = {
+            "event_type": "workflow_step",
+            "step": step,
+            "phase": phase,
+            "call_order": call_order,
+            "details": details or {},
+        }
+        event = JobEvent(
+            at=datetime.now(timezone.utc),
+            state=job.current_state,
+            message=message,
+            metadata=metadata,
+        )
+        job.history.append(event)
+        self.store.append_event(job.job_id, event)
+        self.audit_logger.log(
+            job_id=job.job_id,
+            category="workflow",
+            action=f"{step}:{phase}",
+            metadata=metadata,
+        )
+
+    def _record_agent_decisions(self, job: JobRecord, crew_metadata: dict[str, Any]) -> None:
+        tasks = crew_metadata.get("tasks", [])
+        if not isinstance(tasks, list):
+            return
+
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            role = str(task.get("role", "unknown"))
+            phase = str(task.get("phase", "pan_out" if role != "leader" else "pan_in"))
+            task_name = str(task.get("name", "unknown"))
+            call_order = len(job.history) + 1
+            metadata = {
+                "event_type": "agent_decision",
+                "agent_role": role,
+                "task_name": task_name,
+                "phase": phase,
+                "call_order": call_order,
+                "decision": f"{role} planned task {task_name}",
+                "async_execution": bool(task.get("async_execution", False)),
+            }
+            event = JobEvent(
+                at=datetime.now(timezone.utc),
+                state=job.current_state,
+                message=f"Agent decision recorded: {role} -> {task_name}",
+                metadata=metadata,
+            )
+            job.history.append(event)
+            self.store.append_event(job.job_id, event)
+            self.audit_logger.log(
+                job_id=job.job_id,
+                category="agent",
+                action="decision_recorded",
+                metadata=metadata,
+            )
+
+    @staticmethod
+    def _count_state_transitions(job: JobRecord) -> int:
+        if not job.history:
+            return 0
+
+        transitions = 0
+        previous_state = job.history[0].state
+        for event in job.history[1:]:
+            if event.state != previous_state:
+                transitions += 1
+                previous_state = event.state
+        return transitions
 
     @staticmethod
     def _request_hash(*, goal: str, repo: str, base_branch: str) -> str:

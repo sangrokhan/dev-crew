@@ -1,3 +1,5 @@
+import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -18,8 +20,31 @@ def _wait_for_terminal_state(client: TestClient, job_id: str, timeout_sec: float
     raise AssertionError("job did not reach terminal state in time")
 
 
+def _read_job_events(db_path: Path, job_id: str) -> list[dict]:
+    with sqlite3.connect(str(db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, state, message, metadata_json
+            FROM job_events
+            WHERE job_id = ?
+            ORDER BY id ASC
+            """,
+            (job_id,),
+        ).fetchall()
+    return [
+        {
+            "id": row[0],
+            "state": row[1],
+            "message": row[2],
+            "metadata": json.loads(row[3]),
+        }
+        for row in rows
+    ]
+
+
 def test_create_and_get_job_flow(tmp_path: Path) -> None:
-    app = create_app(str(tmp_path / "jobs.db"))
+    db_path = tmp_path / "jobs.db"
+    app = create_app(str(db_path))
 
     with TestClient(app) as client:
         create = client.post(
@@ -38,6 +63,36 @@ def test_create_and_get_job_flow(tmp_path: Path) -> None:
         status_body = status.json()
         assert status_body["job_id"] == job_id
         assert status_body["history_count"] >= 2
+
+        events = _read_job_events(db_path, job_id)
+        workflow_steps = [
+            event["metadata"]
+            for event in events
+            if event["metadata"].get("event_type") == "workflow_step"
+        ]
+        assert workflow_steps
+
+        workflow_keys = [f"{event['step']}:{event['phase']}" for event in workflow_steps]
+        assert "request:received" in workflow_keys
+        assert "pan_out:started" in workflow_keys
+        assert "pan_out:completed" in workflow_keys
+        assert "pan_in:completed" in workflow_keys
+        assert "aggregation:completed" in workflow_keys
+        assert "final_conclusion:completed" in workflow_keys
+
+        call_orders = [event["call_order"] for event in workflow_steps]
+        assert call_orders == sorted(call_orders)
+        assert len(call_orders) == len(set(call_orders))
+
+        decisions = [
+            event["metadata"]
+            for event in events
+            if event["metadata"].get("event_type") == "agent_decision"
+        ]
+        assert decisions
+        roles = {decision["agent_role"] for decision in decisions}
+        assert "leader" in roles
+        assert "backend" in roles
 
 
 def test_idempotency_reuse_and_conflict(tmp_path: Path) -> None:

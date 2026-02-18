@@ -132,6 +132,7 @@ class CrewAIOrchestrator:
 
     def run(self, job: JobRecord) -> CrewRunResult:
         plan = self.build_plan(job)
+        dry_run_manifest = self._task_manifest_from_plan(plan.tasks)
         if not self.enabled:
             return CrewRunResult(
                 summary="CrewAI disabled; skipped orchestration.",
@@ -139,12 +140,12 @@ class CrewAIOrchestrator:
                     "enabled": False,
                     "dry_run": self.dry_run,
                     "roles": plan.roles,
-                    "tasks": [task.__dict__ for task in plan.tasks],
+                    "tasks": dry_run_manifest,
+                    "workflow": self._workflow_manifest(dry_run_manifest),
                 },
             )
 
         self._prepare_environment()
-        crew, task_manifest = self._build_crew(plan)
         if self.dry_run:
             return CrewRunResult(
                 summary="CrewAI dry-run completed (agents/tasks declared).",
@@ -152,10 +153,12 @@ class CrewAIOrchestrator:
                     "enabled": True,
                     "dry_run": True,
                     "roles": plan.roles,
-                    "tasks": task_manifest,
+                    "tasks": dry_run_manifest,
+                    "workflow": self._workflow_manifest(dry_run_manifest),
                 },
             )
 
+        crew, task_manifest = self._build_crew(plan)
         try:
             output = crew.kickoff(
                 inputs={
@@ -175,6 +178,7 @@ class CrewAIOrchestrator:
                 "dry_run": False,
                 "roles": plan.roles,
                 "tasks": task_manifest,
+                "workflow": self._workflow_manifest(task_manifest),
             },
             raw_output=str(output),
         )
@@ -234,11 +238,16 @@ class CrewAIOrchestrator:
         leader_task_spec: CrewTaskSpec | None = None
         task_manifest: list[dict[str, Any]] = []
         for task_spec in plan.tasks:
+            phase = "pan_in" if task_spec.role == "leader" else "pan_out"
             task_manifest.append(
                 {
                     "name": task_spec.name,
                     "role": task_spec.role,
                     "async_execution": task_spec.async_execution,
+                    "phase": phase,
+                    "description": task_spec.description,
+                    "expected_output": task_spec.expected_output,
+                    "sequence": len(task_manifest) + 1,
                 }
             )
             if task_spec.role == "leader":
@@ -277,3 +286,38 @@ class CrewAIOrchestrator:
             planning=True,
         )
         return crew, task_manifest
+
+    @staticmethod
+    def _workflow_manifest(task_manifest: list[dict[str, Any]]) -> dict[str, Any]:
+        pan_out_tasks = [task for task in task_manifest if task.get("phase") == "pan_out"]
+        pan_in_tasks = [task for task in task_manifest if task.get("phase") == "pan_in"]
+        return {
+            "call_order": [
+                "request",
+                "pan_out",
+                "pan_in",
+                "aggregation",
+                "final_conclusion",
+            ],
+            "pan_out_roles": sorted({task["role"] for task in pan_out_tasks}),
+            "pan_in_roles": sorted({task["role"] for task in pan_in_tasks}),
+            "task_order": [task["name"] for task in task_manifest],
+        }
+
+    @staticmethod
+    def _task_manifest_from_plan(tasks: list[CrewTaskSpec]) -> list[dict[str, Any]]:
+        manifest: list[dict[str, Any]] = []
+        for task in tasks:
+            phase = "pan_in" if task.role == "leader" else "pan_out"
+            manifest.append(
+                {
+                    "name": task.name,
+                    "role": task.role,
+                    "async_execution": task.async_execution,
+                    "phase": phase,
+                    "description": task.description,
+                    "expected_output": task.expected_output,
+                    "sequence": len(manifest) + 1,
+                }
+            )
+        return manifest
