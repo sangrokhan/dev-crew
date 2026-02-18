@@ -58,6 +58,57 @@ OAuth 진행 중 상태(state/code_verifier)도 같은 위치의 `oauth_tokens.p
 `CustomLLMAdapter`는 기본적으로 만료 5분 전(`oauth_refresh_leeway_seconds=300`)부터
 선제적으로 refresh를 시도합니다.
 
+### OAuth 로그인 CLI
+
+웹 브라우저 로그인부터 콜백 대기, 토큰 파일 저장까지 CLI로 실행할 수 있습니다.
+
+선택 환경변수(provider별):
+
+- `..._CLIENT_SECRET`
+- `..._SCOPES` (예: `openid,profile email`)
+- `..._REDIRECT_URI` (기본: provider별 OpenClaw 기본 redirect URI)
+
+OpenClaw 기준 기본값(환경변수로 override 가능):
+
+- `openai-codex`
+  - authorize: `https://auth.openai.com/oauth/authorize`
+  - token: `https://auth.openai.com/oauth/token`
+  - redirect: `http://localhost:1455/auth/callback`
+  - client/scopes 기본값 내장 (`openid profile email offline_access`)
+- `google-antigravity`
+  - authorize: `https://accounts.google.com/o/oauth2/v2/auth`
+  - token: `https://oauth2.googleapis.com/token`
+  - redirect: `http://localhost:51121/oauth-callback`
+  - client/scopes도 OpenClaw 플러그인 기본값을 사용
+
+예시 실행:
+
+```bash
+PYTHONPATH=src python3 -m dev_crew.cli.oauth_login \
+  --provider openai-codex \
+  --account-id default \
+  --status-file ~/.config/dev_crew/oauth_login_status.json
+```
+
+`openai-codex`에서 `DEV_CREW_OAUTH_OPENAI_CODEX_CLIENT_ID`를 미리 설정하지 않았으면,
+실행 중에 OpenClaw authorize URL 전체(또는 raw client_id)를 붙여넣어 바로 진행할 수 있습니다.
+필요하면 `--openai-client-id "<authorize_url_or_client_id>"`로 비대화식 실행도 가능합니다.
+
+원격/VPS 환경(로컬 브라우저에서 로그인 후 redirect URL 붙여넣기):
+
+```bash
+PYTHONPATH=src python3 -m dev_crew.cli.oauth_login \
+  --provider openai-codex \
+  --remote
+```
+
+로컬 모드에서도 callback 자동 감지가 실패하면 redirect URL(또는 code) 수동 입력으로 자동 fallback됩니다.
+
+로그인 성공 시 아래 파일이 갱신됩니다.
+
+- 토큰: `~/.config/dev_crew/oauth_tokens.json` (또는 `DEV_CREW_OAUTH_TOKEN_PATH`)
+- 진행 상태(state/code_verifier): `oauth_tokens.pending.json` (토큰 파일과 같은 디렉터리)
+
 ## 실행 방법
 
 프로젝트 루트에서 실행:

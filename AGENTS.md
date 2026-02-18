@@ -23,21 +23,7 @@ fi
 
 판정 기준:
 - `WORKTREE_OK`: 작업 진행 가능
-- `NOT_WORKTREE`: 즉시 중단 후 사용자에게 worktree 생성/이동 요청
-
-## Required Behavior When NOT_WORKTREE
-
-에이전트는 아래처럼 응답하고 멈춘다.
-
-- 현재 위치가 worktree가 아니므로 수정 작업을 진행할 수 없습니다.
-- `git worktree add ../<repo>-<task> -b codex/<task> main`로 worktree를 만든 뒤, 해당 경로에서 다시 요청해 주세요.
-
-필요 시 예시 명령:
-
-```bash
-git fetch origin
-git worktree add ../dev-crew-docs -b codex/docs-readme-split main
-```
+- `NOT_WORKTREE`: worktree 생성/이동 후 작업 실행
 
 ## Branch Policy
 
