@@ -26,11 +26,24 @@ def test_crewai_orchestrator_declares_parallel_tasks() -> None:
 
     tasks = result.metadata["tasks"]
     assert any(task["role"] == "leader" for task in tasks)
+    assert all("phase" in task for task in tasks)
 
     specialist = [task for task in tasks if task["role"] != "leader"]
     assert specialist
     assert all(task["async_execution"] is True for task in specialist)
+    assert all(task["phase"] == "pan_out" for task in specialist)
 
     leader = [task for task in tasks if task["role"] == "leader"]
     assert len(leader) == 1
     assert leader[0]["async_execution"] is False
+    assert leader[0]["phase"] == "pan_in"
+
+    workflow = result.metadata["workflow"]
+    assert workflow["call_order"] == [
+        "request",
+        "pan_out",
+        "pan_in",
+        "aggregation",
+        "final_conclusion",
+    ]
+    assert "leader" in workflow["pan_in_roles"]
