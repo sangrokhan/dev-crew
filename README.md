@@ -45,7 +45,18 @@ export DEV_CREW_DB_PATH=".dev_crew/jobs.db"
 export DEV_CREW_DOCKER_DRY_RUN=1
 export DEV_CREW_USE_CREWAI=1
 export DEV_CREW_CREWAI_DRY_RUN=1
+export DEV_CREW_OAUTH_TOKEN_PATH="$HOME/.config/dev_crew/oauth_tokens.json"
 ```
+
+OAuth 토큰 파일은 기본적으로 워크스페이스 밖(`~/.config/dev_crew/oauth_tokens.json`)에 저장되며,
+소유자 전용 권한(디렉터리 `0700`, 파일 `0600`)으로 관리됩니다.
+워크스페이스 내부 경로는 기본 차단되어 에이전트 컨텍스트 수집 대상에서 제외됩니다.
+OAuth 진행 중 상태(state/code_verifier)도 같은 위치의 `oauth_tokens.pending.json`에 저장되어
+프로세스 재시작 후에도 로그인 완료를 이어갈 수 있습니다.
+토큰 만료 시에는 `CustomLLMAdapter.invoke(..., token_refresher=...)` 또는
+`OAuthCloneClient.refresh_access_token(...)`으로 재발급 후 같은 파일에 갱신 저장합니다.
+`CustomLLMAdapter`는 기본적으로 만료 5분 전(`oauth_refresh_leeway_seconds=300`)부터
+선제적으로 refresh를 시도합니다.
 
 ## 실행 방법
 
@@ -124,6 +135,8 @@ pytest -q tests/test_phase5_api.py
 - `DEV_CREW_JOB_MAX_TOOL_CALLS` (기본: `10`)
 - `DEV_CREW_AUDIT_LOG_PATH` (기본: `.dev_crew/audit.log`)
 - `DEV_CREW_ESCALATION_LOG_PATH` (기본: `.dev_crew/escalations.log`)
+- `DEV_CREW_OAUTH_TOKEN_PATH` (기본: `$HOME/.config/dev_crew/oauth_tokens.json`)
+- `DEV_CREW_OAUTH_ALLOW_WORKSPACE_PATH` (기본: `0`, 테스트/예외 상황에서만 `1`)
 
 ## 의사결정/구현 이력
 
