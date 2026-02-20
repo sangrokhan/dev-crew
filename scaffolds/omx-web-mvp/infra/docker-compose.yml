@@ -1,0 +1,57 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: omx
+      POSTGRES_PASSWORD: omx
+      POSTGRES_DB: omxweb
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+
+  api:
+    build:
+      context: ..
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgresql://omx:omx@postgres:5432/omxweb?schema=public
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - '8080:8080'
+
+  worker:
+    build:
+      context: ..
+      dockerfile: services/worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://omx:omx@postgres:5432/omxweb?schema=public
+      REDIS_URL: redis://redis:6379
+      WORKER_CONCURRENCY: 2
+      WORK_ROOT: /work
+      TMUX_KEEP_SESSION_ON_FINISH: 1
+      JOB_SKIP_GIT_CLONE: 0
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - worker_runs:/work
+
+volumes:
+  postgres_data:
+  worker_runs:
