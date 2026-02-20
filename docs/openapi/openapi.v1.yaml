@@ -1,0 +1,393 @@
+openapi: 3.1.0
+info:
+  title: OMX Web Orchestrator API
+  version: 0.1.0
+  description: >-
+    Web API to run OMX/OMC-style orchestration jobs through queued workers.
+servers:
+  - url: http://localhost:8080
+paths:
+  /v1/healthz:
+    get:
+      summary: Health check
+      operationId: healthCheck
+      responses:
+        '200':
+          description: API is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+  /v1/jobs:
+    post:
+      summary: Create a new orchestration job
+      operationId: createJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateJobRequest'
+      responses:
+        '201':
+          description: Job created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateJobResponse'
+  /v1/jobs/{jobId}:
+    get:
+      summary: Get current job state
+      operationId: getJob
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Job detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/jobs/{jobId}/actions/{action}:
+    post:
+      summary: Apply an action to a job
+      operationId: jobAction
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+        - $ref: '#/components/parameters/JobAction'
+      responses:
+        '200':
+          description: Action accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Invalid action for current state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/jobs/{jobId}/team:
+    get:
+      summary: Get normalized team state for team mode job
+      operationId: getTeamState
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Team state snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TeamState'
+        '400':
+          description: Not a team-mode job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/jobs/{jobId}/events:
+    get:
+      summary: Stream job events with Server-Sent Events
+      operationId: streamJobEvents
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  event: log
+                  data: {"jobId":"...","type":"queued","message":"Job queued"}
+components:
+  parameters:
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    JobAction:
+      name: action
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [approve, reject, cancel, resume]
+  responses:
+    NotFound:
+      description: Entity not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    Provider:
+      type: string
+      enum: [codex, claude]
+    JobMode:
+      type: string
+      enum: [autopilot, team, ralph, ultrawork, pipeline]
+    JobStatus:
+      type: string
+      enum: [queued, running, waiting_approval, succeeded, failed, canceled]
+    ApprovalState:
+      type: string
+      enum: [none, required, approved, rejected]
+    AgentCommands:
+      type: object
+      additionalProperties: false
+      properties:
+        planner:
+          type: string
+          description: Command template for planner pane
+          example: codex exec --json --full-auto --cd "$JOB_WORKDIR" "planner role for $JOB_TASK"
+        researcher:
+          type: string
+          description: Command template for researcher role
+        designer:
+          type: string
+          description: Command template for designer role
+        developer:
+          type: string
+          description: Command template for developer role
+        executor:
+          type: string
+          description: Command template for executor pane
+        verifier:
+          type: string
+          description: Command template for verifier pane
+    JobOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        workers:
+          type: integer
+          minimum: 1
+          maximum: 16
+          default: 1
+        maxMinutes:
+          type: integer
+          minimum: 5
+          maximum: 480
+          default: 60
+        requireApproval:
+          type: boolean
+          default: false
+        keepTmuxSession:
+          type: boolean
+          default: true
+          description: Keep tmux session after completion for inspection
+        agentCommands:
+          $ref: '#/components/schemas/AgentCommands'
+        team:
+          $ref: '#/components/schemas/TeamOptions'
+    TeamOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        maxFixAttempts:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 2
+        parallelTasks:
+          type: integer
+          minimum: 1
+          maximum: 8
+          default: 1
+        teamTasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/TeamTaskTemplate'
+        extras:
+          type: object
+          additionalProperties: true
+          description: Reserved extensibility object
+    TeamTaskTemplate:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - role
+      properties:
+        id:
+          type: string
+          description: Optional stable id for task
+        name:
+          type: string
+          minLength: 2
+          maxLength: 180
+        role:
+          type: string
+          enum: [planner, researcher, designer, developer, executor, verifier]
+        dependencies:
+          type: array
+          items:
+            type: string
+        maxAttempts:
+          type: integer
+          minimum: 1
+          maximum: 5
+        timeoutSeconds:
+          type: integer
+          minimum: 60
+          maximum: 3600
+    TeamState:
+      type: object
+      required:
+        - status
+        - phase
+        - fixAttempts
+        - maxFixAttempts
+        - parallelTasks
+        - tasks
+      properties:
+        status:
+          type: string
+        phase:
+          type: string
+        fixAttempts:
+          type: integer
+          minimum: 0
+        maxFixAttempts:
+          type: integer
+          minimum: 0
+        parallelTasks:
+          type: integer
+          minimum: 1
+        currentTaskId:
+          type: string
+          nullable: true
+        tasks:
+          type: array
+          items:
+            type: object
+    CreateJobRequest:
+      type: object
+      additionalProperties: false
+      required: [provider, mode, repo, ref, task]
+      properties:
+        provider:
+          $ref: '#/components/schemas/Provider'
+        mode:
+          $ref: '#/components/schemas/JobMode'
+        repo:
+          type: string
+          description: Git clone URL or org/repo slug
+          example: git@github.com:org/project.git
+        ref:
+          type: string
+          example: main
+        task:
+          type: string
+          minLength: 3
+          maxLength: 4000
+        options:
+          $ref: '#/components/schemas/JobOptions'
+    CreateJobResponse:
+      type: object
+      required: [jobId, status]
+      properties:
+        jobId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/JobStatus'
+    Job:
+      type: object
+      required:
+        [
+          id,
+          provider,
+          mode,
+          repo,
+          ref,
+          task,
+          status,
+          approvalState,
+          createdAt,
+          updatedAt,
+        ]
+      properties:
+        id:
+          type: string
+          format: uuid
+        provider:
+          $ref: '#/components/schemas/Provider'
+        mode:
+          $ref: '#/components/schemas/JobMode'
+        repo:
+          type: string
+        ref:
+          type: string
+        task:
+          type: string
+        options:
+          type: object
+          nullable: true
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        approvalState:
+          $ref: '#/components/schemas/ApprovalState'
+        output:
+          type: object
+          nullable: true
+        error:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        finishedAt:
+          type: string
+          format: date-time
+          nullable: true
+    JobEvent:
+      type: object
+      required: [id, jobId, type, message, createdAt]
+      properties:
+        id:
+          type: string
+        jobId:
+          type: string
+          format: uuid
+        type:
+          type: string
+          example: phase_changed
+        message:
+          type: string
+        payload:
+          type: object
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+    ErrorResponse:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
