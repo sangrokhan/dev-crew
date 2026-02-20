@@ -209,3 +209,12 @@ __marimo__/
 # Dev Crew runtime state
 .dev_crew/
 Library/
+
+# Node / TypeScript
+node_modules/
+services/*/node_modules/
+services/*/dist/
+*.tsbuildinfo
+
+# Local orchestrator runtime state
+.omx/

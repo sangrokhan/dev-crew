@@ -1,0 +1,52 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: ${PORT:-8080}
+      OMX_STATE_ROOT: /app/.omx/state/jobs
+    ports:
+      - '${API_PORT:-8080}:8080'
+    volumes:
+      - omx_state:/app/.omx/state/jobs
+
+  worker:
+    build:
+      context: ..
+      dockerfile: services/worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      OMX_STATE_ROOT: /app/.omx/state/jobs
+      WORKER_CONCURRENCY: 2
+      WORK_ROOT: /work
+      TMUX_KEEP_SESSION_ON_FINISH: 1
+      JOB_SKIP_GIT_CLONE: 0
+      JOB_CLI_BIN: ${JOB_CLI_BIN:-codex}
+      JOB_CODEX_CLI_BIN: ${JOB_CODEX_CLI_BIN:-codex}
+      JOB_CLAUDE_CLI_BIN: ${JOB_CLAUDE_CLI_BIN:-claude}
+      JOB_GEMINI_CLI_BIN: ${JOB_GEMINI_CLI_BIN:-gemini}
+      DEV_CREW_CODEX_HOME: ${DEV_CREW_CODEX_HOME:-/app/.codex}
+      DEV_CREW_CLAUDE_HOME: ${DEV_CREW_CLAUDE_HOME:-/app/.claude}
+      DEV_CREW_GEMINI_HOME: ${DEV_CREW_GEMINI_HOME:-/app/.gemini}
+      DEV_CREW_SHARED_AGENTS_DIR: ${DEV_CREW_SHARED_AGENTS_DIR:-/app/config/cli/agents}
+      DEV_CREW_SHARED_SKILLS_DIR: ${DEV_CREW_SHARED_SKILLS_DIR:-/app/config/cli/skills}
+      JOB_CODEX_PLANNER_CMD: ${JOB_CODEX_PLANNER_CMD:-}
+      JOB_CODEX_RESEARCHER_CMD: ${JOB_CODEX_RESEARCHER_CMD:-}
+      JOB_CODEX_DESIGNER_CMD: ${JOB_CODEX_DESIGNER_CMD:-}
+      JOB_CODEX_DEVELOPER_CMD: ${JOB_CODEX_DEVELOPER_CMD:-}
+      JOB_CODEX_EXECUTOR_CMD: ${JOB_CODEX_EXECUTOR_CMD:-}
+      JOB_CODEX_VERIFIER_CMD: ${JOB_CODEX_VERIFIER_CMD:-}
+      JOB_GEMINI_PLANNER_CMD: ${JOB_GEMINI_PLANNER_CMD:-}
+      JOB_GEMINI_RESEARCHER_CMD: ${JOB_GEMINI_RESEARCHER_CMD:-}
+      JOB_GEMINI_DESIGNER_CMD: ${JOB_GEMINI_DESIGNER_CMD:-}
+      JOB_GEMINI_DEVELOPER_CMD: ${JOB_GEMINI_DEVELOPER_CMD:-}
+      JOB_GEMINI_EXECUTOR_CMD: ${JOB_GEMINI_EXECUTOR_CMD:-}
+      JOB_GEMINI_VERIFIER_CMD: ${JOB_GEMINI_VERIFIER_CMD:-}
+    volumes:
+      - omx_state:/app/.omx/state/jobs
+      - worker_runs:/work
+volumes:
+  omx_state:
+  worker_runs:

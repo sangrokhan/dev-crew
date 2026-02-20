@@ -1,0 +1,32 @@
+{
+  "name": "dev-crew",
+  "version": "0.2.0",
+  "private": true,
+  "bin": {
+    "dev-crew": "./bin/dev-crew.mjs",
+    "dev-crew-setup-cli-paths": "./bin/dev-crew-setup-cli-paths.mjs"
+  },
+  "workspaces": [
+    "services/api",
+    "services/worker"
+  ],
+  "scripts": {
+    "postinstall": "node ./bin/dev-crew.mjs setup-cli-paths",
+    "setup:cli-paths": "node ./bin/dev-crew.mjs setup-cli-paths",
+    "setup:cli-paths:dry-run": "node ./bin/dev-crew.mjs setup-cli-paths --dry-run",
+    "build": "npm run build -w services/api && npm run build -w services/worker",
+    "dev": "npm run dev:local",
+    "dev:local": "node ./scripts/dev-local.mjs",
+    "dev:api": "npm run start:dev -w services/api",
+    "dev:worker": "npm run start:dev -w services/worker",
+    "start:api": "npm run start:prod -w services/api",
+    "start:worker": "npm run start:prod -w services/worker",
+    "docker:up": "docker compose -f infra/docker-compose.yml up -d --build",
+    "docker:down": "docker compose -f infra/docker-compose.yml down"
+  },
+  "dependencies": {
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}
