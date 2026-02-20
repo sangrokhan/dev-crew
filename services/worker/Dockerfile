@@ -1,0 +1,35 @@
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+COPY package.json tsconfig.base.json ./
+COPY bin ./bin
+COPY config ./config
+COPY scripts ./scripts
+COPY services/api/package.json ./services/api/package.json
+COPY services/worker/package.json ./services/worker/package.json
+
+ENV DEV_CREW_SKIP_CLI_PATH_SETUP=1
+
+RUN npm install
+
+COPY services/worker ./services/worker
+
+RUN npm run build -w services/worker
+
+FROM node:20-alpine AS runtime
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV HOME=/app
+
+RUN apk add --no-cache bash ca-certificates git openssh tmux && update-ca-certificates
+
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/config ./config
+COPY --from=builder /app/services/worker/package.json ./services/worker/package.json
+COPY --from=builder /app/services/worker/dist ./services/worker/dist
+
+RUN mkdir -p /app/.codex /app/.claude /app/.gemini /app/config/cli/agents /app/config/cli/skills
+
+CMD ["node", "services/worker/dist/index.js"]
