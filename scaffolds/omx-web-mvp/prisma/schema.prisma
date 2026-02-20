@@ -1,0 +1,70 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Provider {
+  codex
+  claude
+}
+
+enum JobMode {
+  autopilot
+  team
+  ralph
+  ultrawork
+  pipeline
+}
+
+enum JobStatus {
+  queued
+  running
+  waiting_approval
+  succeeded
+  failed
+  canceled
+}
+
+enum ApprovalState {
+  none
+  required
+  approved
+  rejected
+}
+
+model Job {
+  id            String        @id @default(uuid())
+  provider      Provider
+  mode          JobMode
+  repo          String
+  ref           String        @default("main")
+  task          String        @db.Text
+  options       Json?
+  status        JobStatus     @default(queued)
+  approvalState ApprovalState @default(none)
+  output        Json?
+  error         String?       @db.Text
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  events        JobEvent[]
+
+  @@index([status, createdAt])
+}
+
+model JobEvent {
+  id        String   @id @default(cuid())
+  jobId     String
+  type      String
+  message   String
+  payload   Json?
+  createdAt DateTime @default(now())
+  job       Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId, createdAt])
+}
