@@ -1,250 +1,224 @@
-# dev-crew
+# dev-crew (TypeScript)
 
-로컬에서 실행 가능한 멀티 에이전트 개발 오케스트레이션 API입니다.
-`job`을 생성하면 상태 전이를 거치며 계획/실행/리포트 흐름을 처리합니다.
+TypeScript/NestJS + BullMQ + 파일 기반 실행 이력 저장소 기반 작업 오케스트레이션 서버입니다.
+현재 루트 기준 운영 경로는 npm 워크스페이스(`services/api`, `services/worker`)입니다.
 
-## 소개
+## Stack
+- Node.js 20+
+- TypeScript 5
+- NestJS (API)
+- BullMQ + Redis (기본 큐) 또는 `REDIS_URL` 미설정 시 파일 큐 폴백
+- `.omx/state/jobs` 파일 기반 저장소 (`record.json`, `events.jsonl`)
+- tmux (멀티 패널 실행)
 
-`dev-crew`는 다음을 제공합니다.
-
-- FastAPI 기반 Job API (`/jobs`, `/jobs/{id}`, SSE 이벤트 스트림)
-- LLM 모델 카탈로그 API (`/llm/models`, `/llm/models/refresh`) + 주기 갱신 캐시
-- LLM 사용량 추적 API (`/llm/usage`, `/llm/usage/reset`) + rolling window 집계
-- In-memory queue + worker로 비동기 처리
-- SQLite 기반 Job/Event/Idempotency 저장
-- CrewAI 오케스트레이션 연동 (dry-run 지원)
-- Docker sandbox 실행기, budget 가드, 감사/에스컬레이션 로그
-
-## 요구사항
-
-- Python 3.11+
-- `pip`
-- (선택) Docker: sandbox 실제 실행 시 필요
-- (선택) `gh` CLI: PR 자동화 확장 시 필요
-
-## 환경설정
-
-### 1) 가상환경 생성
-
+## Quick Start
+1. 의존성 설치
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+npm install
+```
+`npm install` 시 `postinstall`에서 CLI 경로 바인딩을 자동 실행합니다.
+(`~/.codex`, `~/.claude`, `~/.gemini`의 `agents/skills` -> `config/cli/*`)
+
+2. 환경 변수
+```bash
+cp .env.example .env
 ```
 
-### 2) 의존성 설치
-
+3. API + Worker 동시 실행(호스트, 단일 명령어)
 ```bash
-pip install -r requirements.txt
+PORT=8080 npm run dev:local
 ```
 
-### 3) 기본 환경변수(선택)
+`api`와 `worker`가 하나의 터미널에서 동시에 실행됩니다. `REDIS_URL`은 큐 동기화 전용이며,
+작업 상태는 `.omx/state/jobs` 아래 파일로 저장됩니다.
+기본 `PORT=8080` 기준으로 `localhost:8080`에서 API가 기동됩니다.
+`REDIS_URL`이 없으면 API/Worker가 파일 큐(`.omx/state/jobs/.queue`)로 동작합니다.
 
-기본값으로도 실행 가능하지만, 필요 시 아래를 설정하세요.
+## 실행 가이드(운영 실무형)
+
+### 1) 최소 실행 준비
+- Node 20+, npm 10+ 권장
+- 필수 바이너리: `codex`(필요 시 `gemini`, `claude`)
+- tmux 설치 필요(Worker orchestration용)
+- 환경변수 파일 준비
 
 ```bash
-export DEV_CREW_WORKSPACE_ROOT="$(pwd)"
-export DEV_CREW_DB_PATH=".dev_crew/jobs.db"
-export DEV_CREW_USE_CREWAI=1
-export DEV_CREW_CREWAI_DRY_RUN=1
-export DEV_CREW_LOCAL_LLM_MODEL="ollama/llama3.1:8b"
-export DEV_CREW_CREWAI_LLM="$DEV_CREW_LOCAL_LLM_MODEL"
-export DEV_CREW_CREWAI_MANAGER_LLM="$DEV_CREW_LOCAL_LLM_MODEL"
-export DEV_CREW_OLLAMA_BASE_URL="http://127.0.0.1:11434"
-export DEV_CREW_OAUTH_TOKEN_PATH="$HOME/.config/dev_crew/oauth_tokens.json"
-export DEV_CREW_LLM_ACCOUNT_ID="default"
+cp .env.example .env
+npm install
 ```
 
-OAuth 토큰 파일은 기본적으로 워크스페이스 밖(`~/.config/dev_crew/oauth_tokens.json`)에 저장되며,
-소유자 전용 권한(디렉터리 `0700`, 파일 `0600`)으로 관리됩니다.
-워크스페이스 내부 경로는 기본 차단되어 에이전트 컨텍스트 수집 대상에서 제외됩니다.
-OAuth 진행 중 상태(state/code_verifier)도 같은 위치의 `oauth_tokens.pending.json`에 저장되어
-프로세스 재시작 후에도 로그인 완료를 이어갈 수 있습니다.
-토큰 만료 시에는 `CustomLLMAdapter.invoke(..., token_refresher=...)` 또는
-`OAuthCloneClient.refresh_access_token(...)`으로 재발급 후 같은 파일에 갱신 저장합니다.
-`CustomLLMAdapter`는 기본적으로 만료 5분 전(`oauth_refresh_leeway_seconds=300`)부터
-선제적으로 refresh를 시도합니다.
-`openai-codex` 호출에는 access token을 그대로 Bearer 인증으로 사용하고,
-`google-antigravity` 호출에는 OpenClaw와 동일하게
-`{"token":"...","projectId":"..."}` 형식의 토큰 페이로드를 사용합니다.
-`DEV_CREW_CREWAI_LLM`/`DEV_CREW_CREWAI_MANAGER_LLM`이 `codex*`, `gpt*`, `antigravity*`, `gemini*`
-prefix를 사용하면 CrewAI 에이전트는 `CustomLLMAdapter` 경유 질의 경로를 사용합니다.
-
-### OAuth 로그인 CLI
-
-웹 브라우저 로그인부터 콜백 대기, 토큰 파일 저장까지 CLI로 실행할 수 있습니다.
-
-로컬 실행:
+### 2) 핵심 모드 실행(권장: 호스트 단일 포트)
 
 ```bash
-PYTHONPATH=src python3 -m dev_crew.cli.oauth_login \
-  --provider openai-codex \
-  --account-id default \
-  --status-file ~/.config/dev_crew/oauth_login_status.json
+PORT=8080 npm run dev:local
 ```
 
+실행 효과
+- API: `http://localhost:8080`
+- Worker: `.omx/state/jobs` 기반 큐 사용(Redis 미설정 시)
+- `/v1/jobs`로 작업 등록 후 내부 orchestration 수행
+
+### 3) 팀(Task 분할) 모드 실행
+
+1. 작업 등록
 ```bash
-PYTHONPATH=src python3 -m dev_crew.cli.oauth_login \
-  --provider google-antigravity
-```
-
-원격/VPS 환경(로컬 브라우저에서 로그인 후 redirect URL 붙여넣기):
-
-```bash
-PYTHONPATH=src python3 -m dev_crew.cli.oauth_login \
-  --provider openai-codex \
-  --remote
-```
-
-로컬 모드에서도 callback 자동 감지가 실패하면 redirect URL(또는 code) 수동 입력으로 자동 fallback됩니다.
-
-옵션:
-
-- `--status-file <path>`: 로그인 완료 메타데이터 JSON 저장
-- `--openai-client-id <client_id_or_authorize_url>`: OpenAI client id 직접 지정
-- `--token-path <path>`: 토큰 저장 경로 변경
-
-로그인 성공 시 아래 파일이 갱신됩니다.
-
-- 토큰: `~/.config/dev_crew/oauth_tokens.json` (또는 `DEV_CREW_OAUTH_TOKEN_PATH`)
-- 진행 상태(state/code_verifier): `oauth_tokens.pending.json` (토큰 파일과 같은 디렉터리)
-
-## 실행 방법
-
-프로젝트 루트에서 실행:
-
-```bash
-PYTHONPATH=src uvicorn dev_crew.api.app:app --reload --host 0.0.0.0 --port 8000
-```
-
-서버 확인:
-
-```bash
-curl -s http://localhost:8000/docs | head
-```
-
-## 사용법
-
-### 1) Job 생성
-
-```bash
-curl -s -X POST "http://localhost:8000/jobs" \
+curl -s -X POST http://localhost:8080/v1/jobs \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: demo-job-001" \
   -d '{
-    "goal": "Implement API endpoint",
-    "repo": "org/repo",
-    "base_branch": "main"
+    "provider": "codex",
+    "mode": "team",
+    "repo": "owner/repo",
+    "ref": "main",
+    "task": "요청사항을 팀 모드로 분해해 실행해줘",
+    "options": {
+      "keepTmuxSession": true,
+      "maxMinutes": 60
+    }
   }'
 ```
 
-### 2) Job 상태 조회
-
+2. jobId 확인 후 상태 점검
 ```bash
-curl -s "http://localhost:8000/jobs/<job_id>"
+curl -s http://localhost:8080/v1/jobs/{jobId}
+curl -s http://localhost:8080/v1/jobs/{jobId}/team
+curl -s http://localhost:8080/v1/jobs/{jobId}/events
 ```
 
-### 3) 이벤트 스트림(SSE)
-
+3. tmux 상태 확인(필요 시 attach)
 ```bash
-curl -N "http://localhost:8000/jobs/<job_id>/events"
+curl -s http://localhost:8080/v1/jobs/{jobId}/events | rg -n "tmux_session_started|attachCommand"
 ```
 
-### 4) 에스컬레이션 조회
-
+4. 필요한 경우 재개
 ```bash
-curl -s "http://localhost:8000/jobs/<job_id>/escalations"
+curl -s -X POST http://localhost:8080/v1/jobs/{jobId}/actions/resume
 ```
 
-### 5) LLM 모델 목록 조회/강제 갱신
+### 4) 실행 중 모니터링
 
+- 팀 상태 파일:
+  - `.omx/state/team/<team-name>/tasks/`
+  - `.omx/state/team/<team-name>/workers/`
+  - `.omx/state/team/<team-name>/events.jsonl`
+  - `.omx/state/team/<team-name>/monitor-snapshot.json`
+- API 이벤트: `/v1/jobs/{jobId}/events`
+- 검증 체크 기준:
+  - `pending=0`, `blocked=0`, `in_progress=0`
+  - verify 통과
+  - 허용 실패 정책 충족
+
+### 5) 종료 및 정리
+- 서버 종료: 터미널에서 `Ctrl+C`
+- tmux 남은 세션 정리(필요 시):
 ```bash
-curl -s "http://localhost:8000/llm/models"
+tmux ls
+tmux kill-session -t <session-name>
+```
+- 작업 잔존 상태 정리(옵션):
+```bash
+rm -rf .omx/state/team/<team-name>
+rm -rf .omx/state/jobs
 ```
 
-```bash
-curl -s "http://localhost:8000/llm/models?provider=openai-codex&force_refresh=true"
-```
+> 파일 기반 모드는 복구/재시작에 유리합니다.  
+> Redis를 사용하지 않아도 동작하도록 설계되어 있어 데이터 의존성은 최소화됩니다.
+
+## Docker 단일 실행(호스트 포트 하나만 사용)
+
+아래는 API/Worker를 한 번에 띄우는 Docker 실행입니다.
 
 ```bash
-curl -s -X POST "http://localhost:8000/llm/models/refresh?provider=google-antigravity"
+API_PORT=18080 npm run docker:up
 ```
 
-### 6) LLM 사용량 추적 조회/초기화
+Swagger: `http://localhost:18080/docs`
+
+## Job 실행 예시
+```bash
+curl -s -X POST http://localhost:8080/v1/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "codex",
+    "mode": "team",
+    "repo": "owner/repo",
+    "ref": "main",
+    "task": "plan 결과 기준으로 tmux 병렬 실행 후 결과를 동기화해줘",
+    "options": {
+      "maxMinutes": 30,
+      "keepTmuxSession": true
+    }
+  }'
+```
+
+이후 `GET /v1/jobs/{jobId}/events`에서 `tmux_session_started` 이벤트의
+`attachCommand`를 확인해 `tmux` 세션에 접속할 수 있습니다.
+
+team 모드 실행 중 상태를 보기 위해서는 다음도 함께 확인합니다.
 
 ```bash
-curl -s "http://localhost:8000/llm/usage"
+curl -s http://localhost:8080/v1/jobs/{jobId}/team
 ```
+
+Team 모드 동작 범위와 현재 미완성 항목은 `docs/CODEX_TEAM_IMPLEMENTATION_DELIVERY.md`를 참고하세요.
+
+`paused/requires approval` 상태에서 재개하려면 아래를 호출합니다.
 
 ```bash
-curl -s "http://localhost:8000/llm/usage?provider=openai-codex&model=gpt-5-codex-mini"
+curl -s -X POST http://localhost:8080/v1/jobs/{jobId}/actions/resume
 ```
 
+## CLI Bin 구조
+- `bin/dev-crew.mjs`: 공용 CLI 엔트리
+- `bin/dev-crew-setup-cli-paths.mjs`: 실행 파일명 기반 단축 엔트리
+- `scripts/bin/dispatch.mjs`: 실행 파일명/서브커맨드 디스패처
+- `scripts/setup-cli-paths.mjs`: codex/claude/gemini 경로 바인딩 로직
+
+경로 바인딩 수동 실행:
 ```bash
-curl -s -X POST "http://localhost:8000/llm/usage/reset"
+npm run setup:cli-paths
+npm run setup:cli-paths:dry-run
+node ./bin/dev-crew.mjs setup-cli-paths --strict
 ```
 
-## 테스트
+경로 바인딩 제어 환경변수:
+- `DEV_CREW_SKIP_CLI_PATH_SETUP=1` (postinstall 자동 바인딩 비활성화)
+- `DEV_CREW_CODEX_HOME`
+- `DEV_CREW_CLAUDE_HOME`
+- `DEV_CREW_GEMINI_HOME`
+- `DEV_CREW_SHARED_AGENTS_DIR` (기본: `config/cli/agents`)
+- `DEV_CREW_SHARED_SKILLS_DIR` (기본: `config/cli/skills`)
 
-전체 테스트 실행:
+## Scripts
+- `npm run setup:cli-paths`
+- `npm run setup:cli-paths:dry-run`
+- `npm run dev:local`
+- `npm run dev:api`
+- `npm run dev:worker`
+- `npm run build`
+- `npm run start:api`
+- `npm run start:worker`
+- `npm run docker:up`
+- `npm run docker:down`
 
+포트 충돌 시 Docker 실행 예시:
 ```bash
-pytest -q
+API_PORT=18080 npm run docker:up
 ```
 
-특정 테스트만 실행:
-
-```bash
-pytest -q tests/test_phase5_api.py
-```
-
-## 주요 설정값
-
-자주 쓰는 환경변수만 정리했습니다.
-
-- `DEV_CREW_WORKSPACE_ROOT` (기본: `.`)
-- `DEV_CREW_DB_PATH` (기본: `.dev_crew/jobs.db`)
-- `DEV_CREW_USE_CREWAI` (기본: `1`)
-- `DEV_CREW_CREWAI_DRY_RUN` (기본: `1`)
-- `DEV_CREW_LOCAL_LLM_MODEL` (기본: `ollama/llama3.1:8b`)
-- `DEV_CREW_CREWAI_LLM` (기본: `DEV_CREW_LOCAL_LLM_MODEL`)
-- `DEV_CREW_CREWAI_MANAGER_LLM` (기본: `DEV_CREW_CREWAI_LLM`)
-- `DEV_CREW_LLM_ACCOUNT_ID` (기본: `default`)
-- `DEV_CREW_LLM_REQUEST_TIMEOUT_SECONDS` (기본: `60`)
-- `DEV_CREW_OLLAMA_BASE_URL` (기본: `http://127.0.0.1:11434`)
-- `DEV_CREW_DOCKER_TIMEOUT_SECONDS` (기본: `120`)
-- `DEV_CREW_JOB_MAX_STATE_TRANSITIONS` (기본: `20`)
-- `DEV_CREW_JOB_MAX_TOOL_CALLS` (기본: `10`)
-- `DEV_CREW_AUDIT_LOG_PATH` (기본: `.dev_crew/audit.log`)
-- `DEV_CREW_ESCALATION_LOG_PATH` (기본: `.dev_crew/escalations.log`)
-- `DEV_CREW_OAUTH_TOKEN_PATH` (기본: `$HOME/.config/dev_crew/oauth_tokens.json`)
-- `DEV_CREW_OAUTH_ALLOW_WORKSPACE_PATH` (기본: `0`, 테스트/예외 상황에서만 `1`)
-- `DEV_CREW_MODEL_CATALOG_ACCOUNT_ID` (기본: `default`)
-- `DEV_CREW_MODEL_CATALOG_REFRESH_SECONDS` (기본: `600`)
-- `DEV_CREW_MODEL_CATALOG_AUTO_REFRESH` (기본: `1`)
-- `DEV_CREW_MODEL_CATALOG_STARTUP_REFRESH` (기본: `1`)
-- `DEV_CREW_MODEL_CATALOG_HTTP_TIMEOUT_SECONDS` (기본: `10`)
-- `DEV_CREW_CODEX_CLIENT_VERSION` (기본: `0.1.0`)
-- `DEV_CREW_LLM_USAGE_WINDOW_MINUTES` (기본: `60`)
-- `DEV_CREW_CODEX_RESPONSES_URL` (기본: `https://chatgpt.com/backend-api/codex/responses`)
-- `DEV_CREW_ANTIGRAVITY_GENERATE_URL` (기본: `https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent`)
-- `DEV_CREW_ANTIGRAVITY_LOAD_CODE_ASSIST_URL` (기본: `https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`)
-
-## 의사결정/구현 이력
-
-기존 결정사항과 단계별 구현 기록은 아래 문서로 분리했습니다.
-
-- `docs/DECISIONS.md`
-
-## 프로젝트 구조
-
+## Directory
 ```text
-src/dev_crew/
-  api/             # FastAPI 엔드포인트
-  services/        # Job 서비스 레이어
-  orchestration/   # CrewAI 오케스트레이션
-  runtime/         # sandbox / budget / audit / escalation
-  storage/         # SQLite 저장소
-  queue/           # in-memory queue
-  tools/           # context/git/quality/pr 래퍼
-tests/             # 단위/통합 테스트
+bin/          # CLI 실행 파일 엔트리
+config/       # 공용 CLI agents/skills 경로
+scripts/      # CLI 디스패처/설정 스크립트
+services/
+  api/        # NestJS API
+  worker/     # BullMQ worker + tmux orchestrator
+docs/openapi/ # OpenAPI spec
+infra/        # docker-compose
 ```
+
+## Legacy Python Code
+기존 Python 구현은 TypeScript 전환 과정에서 분리되었으며, 현재 레포에서 제거되어 있습니다.
+신규 개발/운영 기준은 TypeScript 워크스페이스입니다.
+
+자세한 운영 가이드는 `docs/TYPESCRIPT_OPERATIONS.md`를 참고하세요.
