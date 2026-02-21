@@ -23,6 +23,13 @@ export interface JobEventRecord {
   createdAt: string;
 }
 
+export interface ListJobsOptions {
+  statuses?: JobStatus[];
+  modes?: JobMode[];
+  limit?: number;
+  updatedAfter?: string;
+}
+
 interface StoredEventEnvelope extends JobEventRecord {
   v: 1;
 }
@@ -225,6 +232,55 @@ export class JobFileStore {
   async findJobById(jobId: string): Promise<JobRecord | null> {
     const raw = await this.readRecord(jobId);
     return normalizeJobRecord(raw, jobId);
+  }
+
+  async listJobs(options: ListJobsOptions = {}): Promise<JobRecord[]> {
+    const { statuses, modes, updatedAfter } = options;
+    const limit = Math.max(1, Math.min(2000, Math.floor(options.limit ?? 200)));
+    const updatedAfterMs = updatedAfter ? Date.parse(updatedAfter) : Number.NaN;
+
+    let entries: Array<{ name: string; isDirectory: () => boolean }> = [];
+    try {
+      entries = await fs.readdir(this.stateRoot, { withFileTypes: true, encoding: 'utf8' });
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code === 'ENOENT') {
+        return [];
+      }
+      throw error;
+    }
+
+    const candidates = entries
+      .filter((entry) => entry.isDirectory())
+      .filter((entry) => !entry.name.startsWith('.'));
+
+    const records = await Promise.all(
+      candidates.map(async (entry) => {
+        const raw = await this.readRecord(entry.name);
+        return normalizeJobRecord(raw, entry.name);
+      }),
+    );
+
+    const filtered = records
+      .filter((record): record is JobRecord => record !== null)
+      .filter((record) => (statuses?.length ? statuses.includes(record.status) : true))
+      .filter((record) => (modes?.length ? modes.includes(record.mode) : true))
+      .filter((record) => {
+        if (Number.isNaN(updatedAfterMs)) return true;
+        const recordUpdatedMs = Date.parse(record.updatedAt);
+        if (Number.isNaN(recordUpdatedMs)) return false;
+        return recordUpdatedMs >= updatedAfterMs;
+      })
+      .sort((a, b) => {
+        const aMs = Date.parse(a.updatedAt);
+        const bMs = Date.parse(b.updatedAt);
+        if (Number.isFinite(aMs) && Number.isFinite(bMs) && aMs !== bMs) {
+          return bMs - aMs;
+        }
+        return b.createdAt.localeCompare(a.createdAt);
+      });
+
+    return filtered.slice(0, limit);
   }
 
   async updateJob(jobId: string, patch: Partial<JobRecord>): Promise<JobRecord> {

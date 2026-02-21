@@ -22,6 +22,26 @@ paths:
                   ok:
                     type: boolean
                     example: true
+  /v1/monitor/overview:
+    get:
+      summary: Get global monitoring overview
+      operationId: getMonitorOverview
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2000
+            default: 200
+      responses:
+        '200':
+          description: Monitor overview payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MonitorOverview'
   /v1/jobs:
     post:
       summary: Create a new orchestration job
@@ -91,6 +111,55 @@ paths:
                 $ref: '#/components/schemas/TeamState'
         '400':
           description: Not a team-mode job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/jobs/{jobId}/team/mailbox:
+    get:
+      summary: Get team mailbox messages for team mode job
+      operationId: getTeamMailbox
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Team mailbox snapshot
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TeamMailboxMessage'
+        '400':
+          description: Not a team-mode job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      summary: Send a message into team mailbox
+      operationId: sendTeamMailboxMessage
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TeamMailboxMessageRequest'
+      responses:
+        '201':
+          description: Mailbox message accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TeamMailboxMessage'
+        '400':
+          description: Invalid payload or not a team-mode job
           content:
             application/json:
               schema:
@@ -307,6 +376,10 @@ components:
             terminal:
               type: integer
               minimum: 0
+        mailbox:
+          type: array
+          items:
+            $ref: '#/components/schemas/TeamMailboxMessage'
     TeamTask:
       type: object
       additionalProperties: false
@@ -370,6 +443,71 @@ components:
         output:
           type: object
           nullable: true
+    TeamMailboxKind:
+      type: string
+      enum: [question, instruction, notice, reassign]
+    TeamMailboxMessageRequest:
+      type: object
+      required: [kind, message]
+      properties:
+        kind:
+          $ref: '#/components/schemas/TeamMailboxKind'
+        to:
+          oneOf:
+            - type: string
+              enum: [leader, planner, researcher, designer, developer, executor, verifier]
+            - type: array
+              items:
+                type: string
+                enum: [planner, researcher, designer, developer, executor, verifier]
+        taskId:
+          type: string
+        message:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+        meta:
+          type: object
+          additionalProperties: true
+    TeamMailboxMessage:
+      type: object
+      required: [id, kind, message, createdAt, delivered]
+      properties:
+        id:
+          type: string
+        kind:
+          $ref: '#/components/schemas/TeamMailboxKind'
+        to:
+          oneOf:
+            - type: string
+              enum: [leader, planner, researcher, designer, developer, executor, verifier]
+            - type: array
+              items:
+                type: string
+                enum: [planner, researcher, designer, developer, executor, verifier]
+        taskId:
+          type: string
+          nullable: true
+        message:
+          type: string
+        payload:
+          type: object
+          nullable: true
+          additionalProperties: true
+        meta:
+          type: object
+          nullable: true
+          additionalProperties: true
+        createdAt:
+          type: string
+          format: date-time
+        deliveredAt:
+          type: string
+          format: date-time
+          nullable: true
+        delivered:
+          type: boolean
     CreateJobRequest:
       type: object
       additionalProperties: false
@@ -483,3 +621,158 @@ components:
       properties:
         message:
           type: string
+    MonitorOverview:
+      type: object
+      required: [generatedAt, jobs, activeJobs, activeAgents, tokens]
+      properties:
+        generatedAt:
+          type: string
+          format: date-time
+        jobs:
+          $ref: '#/components/schemas/MonitorJobCounters'
+        activeJobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/MonitorActiveJob'
+        activeAgents:
+          type: array
+          items:
+            $ref: '#/components/schemas/MonitorActiveAgent'
+        tokens:
+          $ref: '#/components/schemas/MonitorTokenUsage'
+    MonitorJobCounters:
+      type: object
+      required: [total, queued, running, waiting_approval, succeeded, failed, canceled, active]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+        queued:
+          type: integer
+          minimum: 0
+        running:
+          type: integer
+          minimum: 0
+        waiting_approval:
+          type: integer
+          minimum: 0
+        succeeded:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        canceled:
+          type: integer
+          minimum: 0
+        active:
+          type: integer
+          minimum: 0
+    MonitorActiveJob:
+      type: object
+      required: [id, provider, mode, status, task, repo, ref, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        provider:
+          $ref: '#/components/schemas/Provider'
+        mode:
+          $ref: '#/components/schemas/JobMode'
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        task:
+          type: string
+        repo:
+          type: string
+        ref:
+          type: string
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+        teamPhase:
+          type: string
+          nullable: true
+        teamMetrics:
+          $ref: '#/components/schemas/TeamStateMetrics'
+    MonitorActiveAgent:
+      type: object
+      required: [jobId, taskId, role, workerId, status, startedAt, lastHeartbeatAt, claimExpiresAt]
+      properties:
+        jobId:
+          type: string
+          format: uuid
+        taskId:
+          type: string
+        role:
+          type: string
+          enum: [planner, researcher, designer, developer, executor, verifier]
+        workerId:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed, blocked, canceled]
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastHeartbeatAt:
+          type: string
+          format: date-time
+          nullable: true
+        claimExpiresAt:
+          type: string
+          format: date-time
+          nullable: true
+    MonitorTokenUsage:
+      type: object
+      required: [inputTokens, outputTokens, totalTokens, jobsWithUsage, jobsWithoutUsage]
+      properties:
+        inputTokens:
+          type: integer
+          minimum: 0
+        outputTokens:
+          type: integer
+          minimum: 0
+        totalTokens:
+          type: integer
+          minimum: 0
+        jobsWithUsage:
+          type: integer
+          minimum: 0
+        jobsWithoutUsage:
+          type: integer
+          minimum: 0
+    TeamStateMetrics:
+      type: object
+      nullable: true
+      properties:
+        total:
+          type: integer
+          minimum: 0
+        queued:
+          type: integer
+          minimum: 0
+        running:
+          type: integer
+          minimum: 0
+        blocked:
+          type: integer
+          minimum: 0
+        succeeded:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        canceled:
+          type: integer
+          minimum: 0
+        terminal:
+          type: integer
+          minimum: 0

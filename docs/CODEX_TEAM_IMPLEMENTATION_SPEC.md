@@ -18,7 +18,7 @@
 - [x] P0: 태스크 claim lease/retry 복구 적용
 - [x] P0: 태스크 단위 승인 게이트(`requiresApproval`) 감지
 - [x] P1: 승인/리뷰 산출물을 다음 단계 입력으로 쓰는 구조화 파이프라인 (`DEPENDENCY_OUTPUTS` 기반)
-- [ ] P1: 분산 worker 협업/메시지 큐 기반 재배정 경로 (미구현)
+- [ ] P1: 분산 worker 협업/메시지 큐 기반 재배정 경로 (부분 구현: mailbox reassign 반영, 분산 큐 라우팅은 미구현)
 - [x] P2: 운영 지표/관측 이벤트 표준화 (`team.state.metrics` 및 `team.task.*` 이벤트)
 - [x] P3: 통합 테스트 실행 (최종)
 
@@ -824,6 +824,8 @@
 
 ## 27. 세부 WBS(원자 작업 단위)
 
+아래 WBS는 **목표 아키텍처(모듈 분리/`/runs` 경로 체계)** 기준이며, 현재 런타임(`services/*/index.ts`, `/v1/jobs/*`)과는 일부 불일치가 존재한다.
+
 ### 27.1 팀 상태 저장소 계층
 
 - [x] `Job.options.team.state` 기반 상태 저장 규격 정리
@@ -831,6 +833,12 @@
 - [ ] 상태 저장소 분리(별도 영속 계층 전환) 필요 시 정책 문서화
 
 ### 27.2 API(NestJS)
+
+현행 구현 메모(2026-02-21, `/v1/jobs` 경로 체계):
+- 팀 상태 조회: `GET /v1/jobs/{jobId}/team`
+- 팀 mailbox 조회/전송: `GET|POST /v1/jobs/{jobId}/team/mailbox`
+- 팀 이벤트 SSE: `GET /v1/jobs/{jobId}/events`
+- 모니터 개요: `GET /v1/monitor/overview`
 
 - [ ] `services/api/src/team/team.module.ts` 생성.
 - [ ] `services/api/src/team/team.controller.ts` 생성.
@@ -854,11 +862,15 @@
 
 ### 27.3 Worker 런타임
 
+현행 구현 메모(2026-02-21):
+- mailbox 정규화/재배정 처리 로직은 `services/worker/src/index.ts`에 통합 구현되어 동작 중
+- `question`/`instruction`/`notice`는 저장·조회 가능, 자동 실행 루프는 `reassign` 중심으로 제한
+
 - [ ] `services/worker/src/team/runtime.ts` 생성.
 - [ ] `services/worker/src/team/codex-runner.ts` 생성.
 - [ ] `services/worker/src/team/scheduler.ts` 생성.
 - [ ] `services/worker/src/team/state-machine.ts` 생성.
-- [ ] `services/worker/src/team/mailbox.ts` 생성.
+- [ ] `services/worker/src/team/mailbox.ts` 생성. *(현재는 `services/worker/src/index.ts` 통합 구현)*
 - [ ] `services/worker/src/team/claim-lease.ts` 생성.
 - [ ] `services/worker/src/team/checkpoint.ts` 생성.
 - [ ] `services/worker/src/team/prompt-builder.ts` 생성.

@@ -81,6 +81,7 @@ curl -s -X POST http://localhost:8080/v1/jobs \
 ```bash
 curl -s http://localhost:8080/v1/jobs/{jobId}
 curl -s http://localhost:8080/v1/jobs/{jobId}/team
+curl -s http://localhost:8080/v1/jobs/{jobId}/team/mailbox
 curl -s http://localhost:8080/v1/jobs/{jobId}/events
 ```
 
@@ -100,6 +101,11 @@ curl -s -X POST http://localhost:8080/v1/jobs/{jobId}/actions/resume
   - `.omx/state/jobs/<job-id>/record.json` (`job.options.team.state` 포함)
   - `.omx/state/jobs/<job-id>/events.jsonl`
 - API 이벤트: `/v1/jobs/{jobId}/events`
+- 팀 mailbox API:
+  - `GET /v1/jobs/{jobId}/team/mailbox`
+  - `POST /v1/jobs/{jobId}/team/mailbox`
+- 모니터 개요 API: `/v1/monitor/overview`
+- 웹 모니터 페이지: `http://localhost:8080/monitor/`
 - 검증 체크 기준:
   - `pending=0`, `blocked=0`, `in_progress=0`
   - verify 통과
