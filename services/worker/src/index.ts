@@ -4,6 +4,12 @@ import path from 'node:path';
 import { Job, Worker } from 'bullmq';
 import { JobFileStore } from './storage/job-file-store';
 import { type JobRecord, Provider, type TeamRole as StoredTeamRole } from './storage/job-types';
+import {
+  type CodexRunOutput,
+  type PlannerParseResult,
+  parsePlannerOutput as parseTeamPlannerOutput,
+  runCodexCommand as runTeamCodexCommand,
+} from './team/codex-runner';
 
 const JOB_QUEUE_NAME = 'jobs';
 const jobStore = new JobFileStore();
@@ -110,6 +116,7 @@ interface TeamTaskState extends TeamTaskTemplate {
   lastHeartbeatAt?: string;
   error?: string;
   output?: Record<string, unknown> | undefined;
+  requiresApproval?: boolean;
 }
 
 type TeamMailboxKind = 'question' | 'instruction' | 'notice' | 'reassign';
@@ -127,15 +134,45 @@ interface TeamMailboxMessage {
   meta?: Record<string, unknown>;
 }
 
+type MailboxDeliveryMessage = {
+  taskId?: string;
+  message: string;
+  payload?: Record<string, unknown>;
+};
+
+type MailboxDeliveryHandlers = {
+  onQuestion?: (message: MailboxDeliveryMessage) => void;
+  onInstruction?: (message: MailboxDeliveryMessage) => void;
+  onNotice?: (message: MailboxDeliveryMessage) => void;
+};
+
 interface TeamRunState {
   status: TeamRunStatus;
   phase: string;
+  approvalTaskId?: string | null;
   fixAttempts: number;
   maxFixAttempts: number;
   parallelTasks: number;
   currentTaskId?: string | null;
   tasks: TeamTaskState[];
   mailbox?: TeamMailboxMessage[];
+  metrics?: {
+    total: number;
+    queued: number;
+    running: number;
+    blocked: number;
+    succeeded: number;
+    failed: number;
+    waitingApproval: number;
+    canceled: number;
+    terminal: number;
+    activeWorkers: number;
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    averageDurationMs: number;
+    maxDurationMs: number;
+  };
 }
 
 interface PaneRuntime {
@@ -248,6 +285,88 @@ function parseIsoMs(value: unknown): number | null {
 
   const parsed = Date.parse(value);
   return Number.isNaN(parsed) ? null : parsed;
+}
+
+function buildTeamRunMetrics(tasks: TeamTaskState[]) {
+  const total = tasks.length;
+  const queued = tasks.filter((task) => task.status === 'queued').length;
+  const running = tasks.filter((task) => task.status === 'running').length;
+  const blocked = tasks.filter((task) => task.status === 'blocked').length;
+  const succeeded = tasks.filter((task) => task.status === 'succeeded').length;
+  const failed = tasks.filter((task) => task.status === 'failed').length;
+  const waitingApproval = tasks.filter((task) => task.requiresApproval).length;
+  const canceled = tasks.filter((task) => task.status === 'canceled').length;
+  let completedDurationMs = 0;
+  let completedTaskCount = 0;
+  let maxDurationMs = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let totalTokens = 0;
+
+  for (const task of tasks) {
+    const startedAt = parseIsoMs(task.startedAt);
+    const finishedAt = parseIsoMs(task.finishedAt);
+    if (startedAt === null || finishedAt === null || finishedAt < startedAt) {
+      continue;
+    }
+
+    const durationMs = finishedAt - startedAt;
+    completedDurationMs += durationMs;
+    completedTaskCount += 1;
+    if (durationMs > maxDurationMs) {
+      maxDurationMs = durationMs;
+    }
+  }
+
+  const averageDurationMs = completedTaskCount > 0 ? Math.round(completedDurationMs / completedTaskCount) : 0;
+
+  for (const task of tasks) {
+    const taskUsage = (() => {
+      const usageCandidate = extractTaskTokenUsage(task.output);
+      if (!usageCandidate) {
+        return null;
+      }
+
+      return usageCandidate;
+    })();
+
+    if (!taskUsage) {
+      continue;
+    }
+
+    inputTokens += taskUsage.inputTokens;
+    outputTokens += taskUsage.outputTokens;
+    totalTokens += taskUsage.totalTokens;
+  }
+
+  return {
+    total,
+    queued,
+    running,
+    blocked,
+    succeeded,
+    failed,
+    waitingApproval,
+    canceled,
+    terminal: succeeded + failed + canceled,
+    activeWorkers: tasks.filter((task) => task.status === 'running' && Boolean(task.workerId)).length,
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    averageDurationMs,
+    maxDurationMs,
+  };
+}
+
+function withTeamRunMetrics(state: TeamRunState): TeamRunState {
+  return {
+    ...state,
+    metrics: buildTeamRunMetrics(state.tasks),
+  };
+}
+
+function isTaskClaimedByOtherWorker(task: TeamTaskState): boolean {
+  return Boolean(task.claimToken && task.workerId && task.workerId !== TEAM_WORKER_ID);
 }
 
 function randomTaskToken(prefix: string): string {
@@ -365,6 +484,56 @@ function withConfigurableBackoff(attempt: number, baseMs: number, maxMs: number)
   const floorWithJitter = floor + Math.floor(upper * Math.random());
 
   return Math.max(floor, jittered + floorWithJitter);
+}
+
+function toTokenNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+    return Math.floor(value);
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : null;
+  }
+
+  return null;
+}
+
+function pickTokenValue(record: Record<string, unknown>, keys: string[]): number | null {
+  for (const key of keys) {
+    const found = toTokenNumber(record[key]);
+    if (found !== null) {
+      return found;
+    }
+  }
+  return null;
+}
+
+function extractTaskTokenUsage(value: unknown): { inputTokens: number; outputTokens: number; totalTokens: number } | null {
+  const record = asObject(value);
+  const candidates = [record, asObject(record.usage), asObject(record.token_usage)];
+
+  for (const candidate of candidates) {
+    const inputTokens = pickTokenValue(candidate, ['input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens', 'input']);
+    const outputTokens = pickTokenValue(candidate, ['output_tokens', 'outputTokens', 'completion_tokens', 'completionTokens', 'output']);
+    let totalTokens = pickTokenValue(candidate, ['total_tokens', 'totalTokens', 'total']);
+
+    if (inputTokens === null && outputTokens === null && totalTokens === null) {
+      continue;
+    }
+
+    if (totalTokens === null && inputTokens !== null && outputTokens !== null) {
+      totalTokens = inputTokens + outputTokens;
+    }
+
+    return {
+      inputTokens: inputTokens ?? 0,
+      outputTokens: outputTokens ?? 0,
+      totalTokens: totalTokens ?? 0,
+    };
+  }
+
+  return null;
 }
 
 function parseNumericValue(value: unknown): number | null {
@@ -566,6 +735,10 @@ function refreshRunningClaims(state: TeamRunState): TeamRunState {
       return task;
     }
 
+    if (isTaskClaimedByOtherWorker(task)) {
+      return task;
+    }
+
     const isClaimFresh = parseIsoMs(task.claimExpiresAt) !== null && parseIsoMs(task.claimExpiresAt)! > nowMs;
     const heartbeatDue = parseIsoMs(task.lastHeartbeatAt) === null || nowMs - parseIsoMs(task.lastHeartbeatAt)! >= heartbeatIntervalMs;
 
@@ -607,123 +780,41 @@ function buildNormalizedTaskOutput(task: TeamTaskState, runner: CodexRunOutput) 
   };
 }
 
-type PlannerOutputValidation = {
-  planSummary: string;
-  tasks: TeamTaskTemplate[];
-};
-
-function normalizeTeamRole(value: unknown): TeamRole | null {
-  if (
-    value === 'planner' ||
-    value === 'researcher' ||
-    value === 'designer' ||
-    value === 'developer' ||
-    value === 'executor' ||
-    value === 'verifier'
-  ) {
-    return value;
+function extractMailboxMessagesFromTaskOutput(task: TeamTaskState, parsed: Record<string, unknown>): TeamMailboxMessage[] {
+  const rawMailbox = parsed.mailbox;
+  if (!rawMailbox) {
+    return [];
   }
 
-  return null;
+  const entries = Array.isArray(rawMailbox) ? rawMailbox : [rawMailbox];
+  if (entries.length === 0) {
+    return [];
+  }
+
+  const normalized = normalizeMailboxMessages(entries.map((entry, index) => ({
+    ...asObject(entry),
+    id: asObject(entry).id ?? `task-output-${task.id}-${index}-${Date.now().toString(36)}`,
+    taskId: asObject(entry).taskId ?? task.id,
+    to: asObject(entry).to ?? task.role,
+    message: typeof asObject(entry).message === 'string' ? asObject(entry).message : '',
+  })));
+
+  return normalized.map((message) => ({
+    ...message,
+    delivered: false,
+    deliveredAt: null,
+  }));
 }
 
-function parsePlannerOutput(value: unknown): PlannerOutputValidation | null {
-  const parsed = asObject(value);
-  const planSummary = typeof parsed.plan_summary === 'string' ? parsed.plan_summary.trim() : '';
-  if (!planSummary) {
-    return null;
+function appendMailboxMessages(state: TeamRunState, extra: TeamMailboxMessage[]): TeamRunState {
+  if (extra.length === 0) {
+    return state;
   }
 
-  const tasksRaw = Array.isArray(parsed.tasks) ? parsed.tasks : [];
-  if (tasksRaw.length === 0) {
-    return null;
-  }
-
-  const taskIds = new Set<string>();
-  const tasks: TeamTaskTemplate[] = [];
-
-  for (const entry of tasksRaw) {
-    const source = asObject(entry);
-    const role = normalizeTeamRole(source.role);
-    if (!role) {
-      return null;
-    }
-
-    const subject = typeof source.subject === 'string' && source.subject.trim() ? source.subject.trim() : '';
-    const description = typeof source.description === 'string' && source.description.trim() ? source.description.trim() : '';
-    if (!subject && !description) {
-      return null;
-    }
-
-    const idRaw = typeof source.id === 'string' && source.id.trim() ? source.id.trim() : '';
-    const id = idRaw || `${role}-${subject.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` || `${role}-${tasks.length + 1}`;
-    if (taskIds.has(id)) {
-      return null;
-    }
-    taskIds.add(id);
-
-    const dependencySource = source.depends_on ?? source.dependencies;
-    const dependenciesRaw = Array.isArray(dependencySource) ? dependencySource : [];
-    const dependencies = dependenciesRaw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
-
-    tasks.push({
-      id,
-      name: subject || description,
-      role,
-      dependencies,
-      maxAttempts: typeof source.maxAttempts === 'number' && source.maxAttempts > 0 ? Math.floor(source.maxAttempts) : 1,
-      timeoutSeconds:
-        typeof source.timeoutSeconds === 'number' && source.timeoutSeconds > 0 ? Math.floor(source.timeoutSeconds) : 1200,
-    });
-  }
-
-  const idSet = new Set(tasks.map((task) => task.id));
-  for (const task of tasks) {
-    for (const dependency of task.dependencies ?? []) {
-      if (!idSet.has(dependency)) {
-        return null;
-      }
-    }
-  }
-
-  const visit = new Map<string, 'unvisited' | 'visiting' | 'visited'>();
-  const byId = new Map(tasks.map((task) => [task.id, task]));
-
-  function hasCycle(taskId: string): boolean {
-    const state = visit.get(taskId) ?? 'unvisited';
-    if (state === 'visiting') {
-      return true;
-    }
-    if (state === 'visited') {
-      return false;
-    }
-
-    visit.set(taskId, 'visiting');
-    const task = byId.get(taskId);
-    if (!task) {
-      visit.set(taskId, 'visited');
-      return false;
-    }
-
-    for (const dependency of task.dependencies ?? []) {
-      if (hasCycle(dependency)) {
-        return true;
-      }
-    }
-
-    visit.set(taskId, 'visited');
-    return false;
-  }
-
-  for (const id of idSet) {
-    if (hasCycle(id)) {
-      return null;
-    }
-  }
-
+  const currentMailbox = normalizeMailboxMessages(state.mailbox);
   return {
-    planSummary,
-    tasks,
+    ...state,
+    mailbox: normalizeMailboxMessages([...currentMailbox, ...extra]),
   };
 }
 
@@ -737,6 +828,10 @@ function parseVerifierResult(value: unknown): 'pass' | 'fail' | null {
 }
 
 function lockTaskForExecution(task: TeamTaskState): Partial<TeamTaskState> {
+  if (isTaskClaimedByOtherWorker(task)) {
+    return {};
+  }
+
   return {
     status: 'running',
     attempt: task.attempt + 1,
@@ -965,13 +1060,6 @@ function commandResultOrThrow(
   };
 }
 
-interface CodexRunOutput {
-  status: number;
-  stdout: string;
-  stderr: string;
-  parsed?: Record<string, unknown>;
-}
-
 function resolveCliBinary(provider: Provider): string {
   const providerBinary = process.env[`JOB_${provider.toUpperCase()}_CLI_BIN`];
   if (providerBinary?.trim()) {
@@ -1004,59 +1092,6 @@ function resolveCliCommandTemplate(command: string, provider: Provider): string 
   }
 
   return '';
-}
-
-function runCodexCommand(provider: Provider, command: string, workdir: string, timeoutMs = 120000): CodexRunOutput {
-  const trimmed = command.trim();
-  const binary = resolveCliBinary(provider);
-  const directMode = resolveCliCommandTemplate(trimmed, provider);
-  const result = directMode
-    ? commandResultOrThrow('sh', ['-lc', trimmed], {
-        cwd: workdir,
-        allowFailure: true,
-        timeout: timeoutMs,
-        env: process.env,
-      })
-    : commandResultOrThrow(
-        binary,
-        [
-          'exec',
-          '--json',
-          '--full-auto',
-          '--skip-git-repo-check',
-          '--cd',
-          workdir,
-          trimmed,
-        ],
-        {
-          cwd: workdir,
-          env: process.env,
-          allowFailure: true,
-          timeout: timeoutMs,
-        },
-      );
-
-  const payload = result.stdout + '\n' + result.stderr;
-  let parsed: unknown = null;
-
-  for (const line of payload.split('\n').map((item) => item.trim()).filter(Boolean).reverse()) {
-    try {
-      const parsedLine = JSON.parse(line);
-      if (parsedLine && typeof parsedLine === 'object') {
-        parsed = parsedLine;
-      }
-      break;
-    } catch {
-      continue;
-    }
-  }
-
-  return {
-    status: result.status,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    parsed: parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : undefined,
-  };
 }
 
 function ensureBinary(binary: string, versionArgs: string[] = ['--version']) {
@@ -1392,6 +1427,10 @@ function seedTeamStateFromOptions(options: Record<string, unknown> | null): Team
       fixAttempts: 0,
       maxFixAttempts: toNonNegativeInt(state.maxFixAttempts, toNonNegativeInt(asObject(team).maxFixAttempts, 1)),
       parallelTasks: Math.max(1, toPositiveInt(state.parallelTasks, toPositiveInt(asObject(team).parallelTasks, 1))),
+      approvalTaskId:
+        typeof state.approvalTaskId === 'string' && state.approvalTaskId.trim().length > 0
+          ? state.approvalTaskId.trim()
+          : null,
       currentTaskId: typeof state.currentTaskId === 'string' ? state.currentTaskId : null,
       mailbox: normalizeMailboxMessages(state.mailbox),
       tasks: persistedTasks,
@@ -1405,6 +1444,10 @@ function seedTeamStateFromOptions(options: Record<string, unknown> | null): Team
     fixAttempts: 0,
     maxFixAttempts: toNonNegativeInt(asObject(team).maxFixAttempts, 2),
     parallelTasks: Math.max(1, toPositiveInt(asObject(team).parallelTasks, 1)),
+    approvalTaskId:
+      typeof state.approvalTaskId === 'string' && state.approvalTaskId.trim().length > 0
+        ? state.approvalTaskId.trim()
+        : null,
     mailbox: [],
     tasks: normalized,
   };
@@ -1430,6 +1473,10 @@ async function readTeamState(job: JobRecord): Promise<TeamRunState> {
     fixAttempts: toPositiveInt(state.fixAttempts, 0),
     maxFixAttempts: toNonNegativeInt(state.maxFixAttempts, seed.maxFixAttempts),
     parallelTasks: Math.max(1, toPositiveInt(state.parallelTasks, seed.parallelTasks)),
+    approvalTaskId:
+      typeof state.approvalTaskId === 'string' && state.approvalTaskId.trim().length > 0
+        ? state.approvalTaskId.trim()
+        : null,
     currentTaskId: typeof state.currentTaskId === 'string' ? state.currentTaskId : null,
     mailbox: normalizeMailboxMessages(state.mailbox),
     tasks,
@@ -1446,6 +1493,7 @@ async function readTeamState(job: JobRecord): Promise<TeamRunState> {
           : task.status,
       attempt: Number.isFinite(task.attempt) ? task.attempt : 0,
     })),
+    metrics: buildTeamRunMetrics(tasks),
   };
 }
 
@@ -1524,6 +1572,7 @@ function normalizeMailboxMessages(value: unknown): TeamMailboxMessage[] {
 async function applyMailboxReassign(
   jobId: string,
   state: TeamRunState,
+  handlers: MailboxDeliveryHandlers = {},
 ): Promise<{ state: TeamRunState; changed: boolean; hasUndeliveredMessages: boolean }> {
   const queue = Array.isArray(state.mailbox) ? [...state.mailbox] : [];
   let changed = false;
@@ -1537,6 +1586,26 @@ async function applyMailboxReassign(
     hasUndeliveredMessages = true;
 
     if (message.kind !== 'reassign' || !message.taskId) {
+      if (message.kind === 'question') {
+        handlers.onQuestion?.({
+          taskId: message.taskId,
+          message: message.message,
+          payload: message.payload,
+        });
+      } else if (message.kind === 'instruction') {
+        handlers.onInstruction?.({
+          taskId: message.taskId,
+          message: message.message,
+          payload: message.payload,
+        });
+      } else if (message.kind === 'notice') {
+        handlers.onNotice?.({
+          taskId: message.taskId,
+          message: message.message,
+          payload: message.payload,
+        });
+      }
+
       return {
         ...message,
         delivered: true,
@@ -1618,6 +1687,10 @@ function normalizeTaskForRead(task: TeamTaskState, tasks: TeamTaskState[]): Team
 }
 
 function isTaskReady(task: TeamTaskState, tasks: TeamTaskState[]): boolean {
+  if (task.requiresApproval) {
+    return false;
+  }
+
   if (task.status === 'succeeded' || task.status === 'running') {
     return true;
   }
@@ -1636,6 +1709,7 @@ function isTaskReady(task: TeamTaskState, tasks: TeamTaskState[]): boolean {
 function selectRunnableTasks(state: TeamRunState): TeamTaskState[] {
   return state.tasks
     .filter((task) => task.status === 'queued' || task.status === 'blocked')
+    .filter((task) => !task.requiresApproval)
     .filter((task) => isTaskReady(task, state.tasks))
     .sort((a, b) => {
       const ai = TEAM_ROLES.indexOf(a.role);
@@ -1748,6 +1822,7 @@ async function persistTeamState(job: JobRecord, state: TeamRunState) {
   if (!current) {
     throw new Error(`job not found: ${job.id}`);
   }
+  const nextState = withTeamRunMetrics(state);
   const base = asObject(current.options);
   const team = asObject(base.team);
   await jobStore.updateJob(job.id, {
@@ -1755,7 +1830,7 @@ async function persistTeamState(job: JobRecord, state: TeamRunState) {
       ...base,
       team: {
         ...team,
-        state: state as unknown as Record<string, unknown>,
+        state: nextState as unknown as Record<string, unknown>,
       },
     },
   });
@@ -1818,6 +1893,7 @@ interface TeamTaskExecutionResult {
   taskId: string;
   patch: Partial<TeamTaskState>;
   requiresApproval?: boolean;
+  mailboxMessages?: TeamMailboxMessage[];
 }
 
 async function executeTeamTask(
@@ -1864,15 +1940,19 @@ async function executeTeamTask(
       dependencyOutputs: summarizeValueForTemplate(collectDependencyOutputs(task, allTasks)),
     });
 
-    const runner = runCodexCommand(
+    const runner = runTeamCodexCommand(
       job.provider,
       command,
       workspaceDir,
       Math.max(30_000, (task.timeoutSeconds ?? 1200) * 1000),
     );
     const normalized = buildNormalizedTaskOutput(taskForAttempt, runner);
-    const plannerValidation = task.role === 'planner' ? parsePlannerOutput(normalized.output.parsed) : null;
+    const plannerParseResult: PlannerParseResult | null = task.role === 'planner'
+      ? parseTeamPlannerOutput(normalized.output.parsed)
+      : null;
+    const plannerValidation = plannerParseResult?.ok ? plannerParseResult.value : null;
     const verifierStatus = task.role === 'verifier' ? parseVerifierResult(normalized.output.parsed) : null;
+    const mailboxMessages = extractMailboxMessagesFromTaskOutput(task, normalized.output.parsed);
     const validationError =
       task.role === 'planner'
         ? (plannerValidation ? undefined : 'Planner output did not match required JSON schema')
@@ -1901,10 +1981,12 @@ async function executeTeamTask(
 
       return {
         taskId: task.id,
+        mailboxMessages,
         requiresApproval: true,
         patch: {
           status: 'queued',
           attempt: currentAttempt,
+          requiresApproval: true,
           error: 'Task output requested approval before continuing.',
           output: normalized.output,
           finishedAt: new Date().toISOString(),
@@ -1932,9 +2014,11 @@ async function executeTeamTask(
       });
       return {
         taskId: task.id,
+        mailboxMessages,
         patch: {
           status: 'succeeded',
           attempt: currentAttempt,
+          requiresApproval: false,
           output: normalized.output,
           finishedAt: new Date().toISOString(),
           workerId: undefined,
@@ -1979,9 +2063,11 @@ async function executeTeamTask(
     });
     return {
       taskId: task.id,
+      mailboxMessages,
       patch: {
         status: 'failed',
         attempt: currentAttempt,
+        requiresApproval: false,
         error: validationError ?? `${runner.stderr || runner.stdout}`.slice(0, 4000),
         output: normalized.output,
         finishedAt: new Date().toISOString(),
@@ -2003,7 +2089,7 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
   const teamVisualization = await setupTeamTmuxVisualization(job, options, runDir, workspaceDir);
 
   try {
-    let state = await readTeamState(job);
+    let state = withTeamRunMetrics(await readTeamState(job));
     state.status = 'running';
     await persistTeamState(job, state);
 
@@ -2019,19 +2105,43 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
 
       if (latest?.status === 'waiting_approval') {
         state.status = 'waiting_approval';
+        state = withTeamRunMetrics(state);
         await persistTeamState(job, state);
         return finalizeTeamRunResult(job.id, teamVisualization, options.keepTmuxSession, { state: 'waiting_approval' });
       }
 
       const current = await readTeamState(job);
+      state = current;
       const nowMs = Date.now();
       const staleRunning = current.tasks.filter((task) => task.status === 'running' && isClaimExpired(task, nowMs));
       const nonReportingRunning = current.tasks.filter((task) => isTaskNonReporting(task, nowMs));
       const normalizedClaims = normalizeRunningClaims(current);
       const refreshedState = refreshRunningClaims(normalizedClaims);
-      state = refreshedState;
-      const mailboxResult = await applyMailboxReassign(job.id, state);
-      state = mailboxResult.state;
+      state = withTeamRunMetrics(refreshedState);
+      const mailboxResult = await applyMailboxReassign(job.id, state, {
+        onQuestion: ({ taskId, message }) => {
+          void addEvent(job.id, 'team.mailbox.question', `Mailbox question for task ${taskId ?? 'general'}`, {
+            taskId,
+            kind: 'question',
+            message,
+          });
+        },
+        onInstruction: ({ taskId, message }) => {
+          void addEvent(job.id, 'team.mailbox.instruction', `Mailbox instruction for task ${taskId ?? 'general'}`, {
+            taskId,
+            kind: 'instruction',
+            message,
+          });
+        },
+        onNotice: ({ taskId, message }) => {
+          void addEvent(job.id, 'team.mailbox.notice', `Mailbox notice for task ${taskId ?? 'general'}`, {
+            taskId,
+            kind: 'notice',
+            message,
+          });
+        },
+      });
+      state = withTeamRunMetrics(mailboxResult.state);
 
       if (JSON.stringify(normalizedClaims) !== JSON.stringify(refreshedState) || mailboxResult.hasUndeliveredMessages) {
         const claimRecoveredTaskIds = state.tasks
@@ -2070,7 +2180,7 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
         if (hasFailed && state.fixAttempts < state.maxFixAttempts) {
           const recovered = buildFailureRecoveryState(state);
           if (recovered) {
-            state = recovered;
+            state = withTeamRunMetrics(recovered);
             await persistTeamState(job, state);
             await addEvent(job.id, 'team.retry', `Retrying failed task path (attempt ${state.fixAttempts}/${state.maxFixAttempts})`, {
               taskIds: state.tasks.map((task) => task.id),
@@ -2080,6 +2190,8 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
         }
 
         state.status = state.tasks.every((task) => task.status === 'succeeded') ? 'succeeded' : 'failed';
+        state.approvalTaskId = null;
+        state = withTeamRunMetrics(state);
         await persistTeamState(job, state);
         await addEvent(job.id, 'team.completed', `Team run ${state.status}`);
         return finalizeTeamRunResult(job.id, teamVisualization, options.keepTmuxSession, {
@@ -2096,13 +2208,15 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
         if (state.tasks.some((task) => task.status === 'failed')) {
           if (state.fixAttempts >= state.maxFixAttempts) {
             state.status = 'failed';
+            state.approvalTaskId = null;
+            state = withTeamRunMetrics(state);
             await persistTeamState(job, state);
             throw new Error('team run fixed attempts exhausted');
           }
 
           const recovered = buildFailureRecoveryState(state);
           if (recovered) {
-            state = recovered;
+            state = withTeamRunMetrics(recovered);
             await persistTeamState(job, state);
             await addEvent(
               job.id,
@@ -2118,12 +2232,15 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
 
         if (state.fixAttempts >= state.maxFixAttempts) {
           state.status = 'failed';
+          state.approvalTaskId = null;
+          state = withTeamRunMetrics(state);
           await persistTeamState(job, state);
           throw new Error('team run blocked with no runnable tasks');
         }
 
         state.status = 'running';
         state.fixAttempts += 1;
+        state = withTeamRunMetrics(state);
         await persistTeamState(job, state);
         await addEvent(job.id, 'team.blocked', 'No runnable task; applying fix attempt backoff');
         await sleep(withBackoffDelay(idleBackoff));
@@ -2141,7 +2258,7 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
       idleCycles = 0;
       idleBackoff = 0;
 
-      state = startTaskBatch(state, runnable);
+      state = withTeamRunMetrics(startTaskBatch(state, runnable));
       await persistTeamState(job, state);
 
       const runningBatch = runnable
@@ -2167,16 +2284,29 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
       );
 
       for (const result of results) {
+        if (result.mailboxMessages && result.mailboxMessages.length > 0) {
+          state = appendMailboxMessages(state, result.mailboxMessages);
+          for (const message of result.mailboxMessages) {
+            await addEvent(job.id, 'team.mailbox.received', `Mailbox ${message.kind} added from task ${result.taskId}`, {
+              taskId: message.taskId,
+              kind: message.kind,
+              message: message.message,
+            });
+          }
+        }
         state = applyTaskPatch(state, result.taskId, result.patch);
       }
 
       state.phase = toTeamTaskPhase(state.tasks);
+      state = withTeamRunMetrics(state);
 
       const requiresApproval = results.some((result) => result.requiresApproval);
       if (requiresApproval) {
         state.status = 'waiting_approval';
         const approvalTask = results.find((result) => result.requiresApproval);
         const approvalTaskId = approvalTask?.taskId ?? 'unknown';
+        state.approvalTaskId = approvalTaskId;
+        state = withTeamRunMetrics(state);
         await persistTeamState(job, state);
         await jobStore.updateJob(job.id, {
           status: 'waiting_approval',
@@ -2200,6 +2330,8 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
     }
 
     state.status = 'failed';
+    state.approvalTaskId = null;
+    state = withTeamRunMetrics(state);
     await persistTeamState(job, state);
     return finalizeTeamRunResult(job.id, teamVisualization, options.keepTmuxSession, {
       state: 'failed',

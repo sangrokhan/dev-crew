@@ -86,6 +86,131 @@ describe('JobsService', () => {
     holder.restore();
   });
 
+  test('team metrics count waitingApproval and active workers', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git@github.com:example/repo.git',
+      ref: 'main',
+      task: 'team metrics test',
+    } as never);
+
+    const baseline = (await holder.service.getTeamState(job.id)) as {
+      status: string;
+      tasks: Array<{
+        id: string;
+        status: string;
+        workerId?: string | null;
+        requiresApproval?: boolean;
+      }>;
+    };
+
+    const updatedState = {
+      ...baseline,
+      tasks: baseline.tasks.map((task, idx) => {
+        if (idx === 0) {
+          return {
+            ...task,
+            status: 'running',
+            workerId: 'worker-1',
+            requiresApproval: true,
+          };
+        }
+
+        return {
+          ...task,
+          requiresApproval: false,
+        };
+      }),
+    };
+
+    const store = (holder.service as never as {
+      store: {
+        updateJob: (jobId: string, patch: Record<string, unknown>) => Promise<unknown>;
+      };
+    }).store;
+
+    await store.updateJob(job.id, {
+      options: {
+        team: {
+          state: updatedState,
+        },
+      },
+    } as never);
+
+    const refreshed = (await holder.service.getTeamState(job.id)) as {
+      metrics: {
+        waitingApproval: number;
+        activeWorkers: number;
+      };
+    };
+
+    assert.equal(refreshed.metrics.waitingApproval, 1);
+    assert.equal(refreshed.metrics.activeWorkers, 1);
+    holder.restore();
+  });
+
+  test('team metrics include task duration stats', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git@github.com:example/repo.git',
+      ref: 'main',
+      task: 'team duration metrics',
+    } as never);
+
+    const baseline = (await holder.service.getTeamState(job.id)) as {
+      tasks: Array<{ id: string; status: string; startedAt?: string; finishedAt?: string }>;
+    };
+
+    const updatedState = {
+      ...baseline,
+      tasks: baseline.tasks.map((task, idx) => {
+        if (idx !== 0) {
+          return {
+            ...task,
+            status: task.status,
+          };
+        }
+
+        return {
+          ...task,
+          status: 'succeeded',
+          startedAt: '2026-02-20T00:00:00.000Z',
+          finishedAt: '2026-02-20T00:00:05.000Z',
+          workerId: 'worker-1',
+        };
+      }),
+    };
+
+    const store = (holder.service as never as {
+      store: {
+        updateJob: (jobId: string, patch: Record<string, unknown>) => Promise<unknown>;
+      };
+    }).store;
+
+    await store.updateJob(job.id, {
+      options: {
+        team: {
+          state: updatedState,
+        },
+      },
+    } as never);
+
+    const refreshed = (await holder.service.getTeamState(job.id)) as {
+      metrics: {
+        averageDurationMs: number;
+        maxDurationMs: number;
+      };
+    };
+
+    assert.equal(refreshed.metrics.averageDurationMs, 5000);
+    assert.equal(refreshed.metrics.maxDurationMs, 5000);
+    holder.restore();
+  });
+
   test('creates approval-required job when requested', async () => {
     const holder = await createService(stateRoot);
     const job = await holder.service.createJob({
@@ -332,6 +457,50 @@ describe('JobsService', () => {
     holder.restore();
   });
 
+  test('approve action clears team approvalTaskId when resuming from approval', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git://example/repo.git',
+      ref: 'main',
+      task: 'approve clears task id',
+    } as never);
+
+    await holder.service.updateTeamTaskState(job.id, (state) => ({
+      ...state,
+      status: 'waiting_approval',
+      approvalTaskId: 'team-executor',
+      tasks: state.tasks.map((task) =>
+        task.id === 'team-planner'
+          ? { ...task, status: 'queued', requiresApproval: true }
+          : task,
+      ),
+    }));
+
+    const store = (holder.service as never as {
+      store: {
+        updateJob: (jobId: string, patch: Record<string, unknown>) => Promise<unknown>;
+      };
+    }).store;
+    await store.updateJob(job.id, {
+      status: 'waiting_approval',
+      approvalState: 'required',
+    } as never);
+
+    const approved = await holder.service.applyAction(job.id, 'approve');
+    assert.equal(approved.status, 'queued');
+    assert.equal(approved.approvalState, 'approved');
+
+    const state = (await holder.service.getTeamState(job.id)) as {
+      status: string;
+      approvalTaskId: string | null;
+    };
+    assert.equal(state.status, 'queued');
+    assert.equal(state.approvalTaskId, null);
+    holder.restore();
+  });
+
   test('reject action marks job failed and stores rejection', async () => {
     const holder = await createService(stateRoot);
     const job = await holder.service.createJob({
@@ -357,6 +526,236 @@ describe('JobsService', () => {
       tasks?: Array<{ id: string; status: string }>;
     };
     assert.equal(state.status, 'waiting_approval');
+    holder.restore();
+  });
+
+  test('reject action clears team approvalTaskId while returning to waiting approval', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git://example/repo.git',
+      ref: 'main',
+      task: 'reject clears task id',
+    } as never);
+
+    await holder.service.updateTeamTaskState(job.id, (state) => ({
+      ...state,
+      status: 'waiting_approval',
+      approvalTaskId: 'team-planner',
+      tasks: state.tasks.map((task) =>
+        task.id === 'team-planner' ? { ...task, status: 'queued', requiresApproval: true } : task,
+      ),
+    }));
+
+    const store = (holder.service as never as {
+      store: {
+        updateJob: (jobId: string, patch: Record<string, unknown>) => Promise<unknown>;
+      };
+    }).store;
+    await store.updateJob(job.id, {
+      status: 'waiting_approval',
+      approvalState: 'required',
+    } as never);
+
+    const rejected = await holder.service.applyAction(job.id, 'reject');
+    assert.equal(rejected.status, 'failed');
+    assert.equal(rejected.approvalState, 'rejected');
+
+    const state = (await holder.service.getTeamState(job.id)) as {
+      status: string;
+      approvalTaskId: string | null;
+    };
+    assert.equal(state.status, 'waiting_approval');
+    assert.equal(state.approvalTaskId, null);
+    holder.restore();
+  });
+
+  test('approve task action clears task approval flag, updates status, and requeues', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git://example/repo.git',
+      ref: 'main',
+      task: 'approve task action',
+    } as never);
+
+    await holder.service.updateTeamTaskState(job.id, (state) => ({
+      ...state,
+      status: 'waiting_approval',
+      tasks: state.tasks.map((task) =>
+        task.id === 'team-planner' ? { ...task, status: 'queued', requiresApproval: true } : task,
+      ),
+    }));
+
+    await (holder.service as never as {
+      store: {
+        updateJob: (jobId: string, patch: Record<string, unknown>) => Promise<unknown>;
+      };
+    }).store.updateJob(job.id, {
+      status: 'waiting_approval',
+      approvalState: 'required',
+    } as never);
+
+    const approved = (await holder.service.applyTaskAction(job.id, 'team-planner', 'approve')) as {
+      status: string;
+      approvalState: string;
+    };
+
+    assert.equal(approved.status, 'queued');
+    assert.equal(approved.approvalState, 'approved');
+    assert.equal(holder.queue.calls.some((entry) => entry.jobId === job.id), true);
+
+    const state = (await holder.service.getTeamState(job.id)) as {
+      tasks: Array<{ id: string; requiresApproval?: boolean }>;
+      status: string;
+    };
+    const task = state.tasks.find((item) => item.id === 'team-planner');
+    assert.equal(task?.requiresApproval ?? false, false);
+    assert.equal(state.status, 'queued');
+    assert.equal((state as unknown as { approvalTaskId: string | null }).approvalTaskId, null);
+    holder.restore();
+  });
+
+  test('task action rejects when not matching awaiting approval task id', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git://example/repo.git',
+      ref: 'main',
+      task: 'reject mismatched task id',
+    } as never);
+
+    const baseline = (await holder.service.getTeamState(job.id)) as {
+      phase: string;
+      tasks: Array<{
+        id: string;
+        status: string;
+        attempt: number;
+        requiresApproval?: boolean;
+      }>;
+      maxFixAttempts?: number;
+      parallelTasks?: number;
+    };
+
+    const store = (holder.service as never as {
+      store: {
+        updateJob: (jobId: string, patch: Record<string, unknown>) => Promise<unknown>;
+      };
+    }).store;
+    await store.updateJob(job.id, {
+      options: {
+        team: {
+          state: {
+            ...baseline,
+            status: 'waiting_approval',
+            phase: baseline.phase,
+            fixAttempts: 0,
+            maxFixAttempts: baseline.maxFixAttempts ?? 2,
+            parallelTasks: baseline.parallelTasks ?? 1,
+            currentTaskId: null,
+            approvalTaskId: 'team-executor',
+            tasks: baseline.tasks.map((task) =>
+              task.id === 'team-planner' ? { ...task, status: 'queued', requiresApproval: true } : task,
+            ),
+          },
+        },
+      },
+      status: 'waiting_approval',
+      approvalState: 'required',
+    } as never);
+
+    const preActionJob = await holder.service.getJob(job.id);
+    const preActionState = (await holder.service.getTeamState(job.id)) as {
+      tasks: Array<{ id: string; requiresApproval?: boolean }>;
+      approvalTaskId?: string | null;
+    };
+    assert.equal(preActionJob.status, 'waiting_approval');
+    assert.equal(preActionJob.approvalState, 'required');
+    assert.equal(preActionState.approvalTaskId, 'team-executor');
+    assert.equal(preActionState.tasks.some((task) => task.id === 'team-planner' && task.requiresApproval === true), true);
+
+    await assert.rejects(
+      () => holder.service.applyTaskAction(job.id, 'team-planner', 'approve'),
+      /Task is not waiting for approval|Task is not currently awaiting approval/,
+    );
+    holder.restore();
+  });
+
+  test('reject task action marks the task and job as failed', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git://example/repo.git',
+      ref: 'main',
+      task: 'reject task action',
+    } as never);
+
+    await holder.service.updateTeamTaskState(job.id, (state) => ({
+      ...state,
+      status: 'waiting_approval',
+      tasks: state.tasks.map((task) =>
+        task.id === 'team-planner' ? { ...task, status: 'queued', requiresApproval: true } : task,
+      ),
+    }));
+
+    await (holder.service as never as {
+      store: {
+        updateJob: (jobId: string, patch: Record<string, unknown>) => Promise<unknown>;
+      };
+    }).store.updateJob(job.id, {
+      status: 'waiting_approval',
+      approvalState: 'required',
+    } as never);
+
+    const rejected = (await holder.service.applyTaskAction(job.id, 'team-planner', 'reject')) as {
+      status: string;
+      approvalState: string;
+      error: string | null;
+    };
+    assert.equal(rejected.status, 'failed');
+    assert.equal(rejected.approvalState, 'rejected');
+    assert.equal(rejected.error, 'Rejected by approver');
+
+    const state = (await holder.service.getTeamState(job.id)) as {
+      status: string;
+      tasks: Array<{ id: string; status: string; requiresApproval?: boolean }>;
+    };
+    const task = state.tasks.find((item) => item.id === 'team-planner');
+    assert.equal(state.status, 'failed');
+    assert.equal(task?.status, 'failed');
+    assert.equal(task?.requiresApproval ?? false, false);
+    holder.restore();
+  });
+
+  test('task action validation rejects non-team jobs', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'gemini',
+      mode: 'autopilot',
+      repo: 'git://example/repo.git',
+      ref: 'main',
+      task: 'non-team task action',
+    } as never);
+
+    await assert.rejects(() => holder.service.applyTaskAction(job.id, 'team-planner', 'approve'), /Task actions are only supported for team jobs/);
+    holder.restore();
+  });
+
+  test('task action validation rejects unknown task id', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git://example/repo.git',
+      ref: 'main',
+      task: 'unknown task action',
+    } as never);
+
+    await assert.rejects(() => holder.service.applyTaskAction(job.id, 'missing-task', 'approve'), /Task not found: missing-task/);
     holder.restore();
   });
 
