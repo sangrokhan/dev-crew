@@ -19,6 +19,7 @@
 - [x] P0: 태스크 단위 승인 게이트(`requiresApproval`) 감지
 - [x] P1: 승인/리뷰 산출물을 다음 단계 입력으로 쓰는 구조화 파이프라인 (`DEPENDENCY_OUTPUTS` 기반)
 - [ ] P1: 분산 worker 협업/메시지 큐 기반 재배정 경로 (부분 구현: mailbox reassign 반영, 분산 큐 라우팅은 미구현)
+- [x] P2: 옵션 기반 Team tmux 역할별 시각화(`options.team.tmuxVisualization`) 반영
 - [x] P2: 운영 지표/관측 이벤트 표준화 (`team.state.metrics` 및 `team.task.*` 이벤트)
 - [x] P3: 통합 테스트 실행 (최종)
 
@@ -124,6 +125,7 @@
 - `Tmux Adapter`(선택):
   - 시각화용 pane 배치.
   - 수동 디버깅 보조.
+  - 현재 구현: `options.team.tmuxVisualization=true`일 때 역할별 pane + attach 이벤트 제공.
 
 ### 5.3 Data Plane
 
@@ -865,6 +867,7 @@
 현행 구현 메모(2026-02-21):
 - mailbox 정규화/재배정 처리 로직은 `services/worker/src/index.ts`에 통합 구현되어 동작 중
 - `question`/`instruction`/`notice`는 저장·조회 가능, 자동 실행 루프는 `reassign` 중심으로 제한
+- Team tmux 시각화 세션은 `options.team.tmuxVisualization` 플래그로 선택 활성화(역할별 pane/tail 로그/attach 이벤트)
 
 - [ ] `services/worker/src/team/runtime.ts` 생성.
 - [ ] `services/worker/src/team/codex-runner.ts` 생성.

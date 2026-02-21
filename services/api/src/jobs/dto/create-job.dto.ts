@@ -124,6 +124,14 @@ class TeamOptionsDto {
   teamTasks?: TeamTaskTemplateDto[];
 
   @ApiPropertyOptional({
+    default: false,
+    description: 'Enable tmux role-pane visualization for team mode execution.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  tmuxVisualization?: boolean;
+
+  @ApiPropertyOptional({
     description: 'Reserved object for future plan/approval extensions.',
   })
   @IsOptional()

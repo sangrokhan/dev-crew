@@ -280,6 +280,10 @@ components:
           minimum: 1
           maximum: 8
           default: 1
+        tmuxVisualization:
+          type: boolean
+          default: false
+          description: Enable tmux role-pane visualization for team mode execution
         teamTasks:
           type: array
           items:

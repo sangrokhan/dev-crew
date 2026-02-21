@@ -30,6 +30,7 @@
 - [x] P0: 승인 게이트(태스크 승인 요구) 상태 기록 체계 반영
 - [x] P1: 작업자 heartbeat 기반 non-reporting 정합성 처리 강화
 - [x] P1: worker/태스크 재배정 규칙의 고도화
+- [x] P2: 옵션 기반 Team tmux 역할별 시각화(`options.team.tmuxVisualization`) 반영
 - [x] P2: 이벤트 카테고리 일관성(`team.task.approval_required` 등) 정리
 - [x] P3: 통합 테스트 실행
 
@@ -41,6 +42,7 @@
 3. 팀 설정 초기화
 4. worker 수를 반영한 seed task 기반 스케줄링
 5. worker별 실행 셸/인박스 생성 후 트리거 전달
+6. `options.team.tmuxVisualization=true`이면 역할별 pane 시각화 세션을 생성하고 `tmux_session_started` 이벤트를 발행
 
 ### 3.2 Task 배정
 - `assignTask(team, worker, taskId)` 실행
@@ -109,6 +111,7 @@
 - [ ] bootstrap task 수가 worker 수와 일치하는가?
 - [x] task 의존성 기준으로 할당되는가?
 - [x] heartbeat 및 non_reporting 감지가 상태에 반영되는가?
+- [x] 옵션 기반 tmux 역할별 시각화 세션이 생성되고 attach 정보가 이벤트로 노출되는가?
 - [x] 완료 판정이 집계값을 사용해 종료되는가?
 - [ ] 완료 판정에 verify 승인 상태까지 통합 반영
 - [x] 종료 후 잔존 자원과 상태 정리 동작이 남아있다

@@ -144,7 +144,7 @@
 - [x] 실패 체인(retry cascade) 기반 복귀(`buildFailureRecoveryState`)
 - [x] 승인/재개 API 처리
 - [x] SSE 이벤트 스트림
-- [x] tmux 기반 실행은 비Team 모드에서 유지, Team 모드는 codex 단일 실행 경로
+- [x] tmux 기반 실행은 비Team 모드에서 유지, Team 모드는 codex 단일 실행 경로를 유지하되 시각화는 옵션(`options.team.tmuxVisualization`)으로 제공
 
 ## 6) 현재 미완성 항목 (오픈)
 
@@ -156,7 +156,7 @@
 - [x] 승인 게이트를 태스크 단위로 분기
 - [x] 작업자 하트비트/Lease 기반 claim 분산 및 리커버리
 - [x] team 작업 상태를 별도 정규형 테이블로 분리하지 않음(`Job.options.team.state` JSON 사용)
-- [ ] tmux 시각화 모드에서 팀 역할별 멀티 pane 운영 미구현
+- [x] tmux 시각화 모드에서 팀 역할별 멀티 pane 운영 부분 구현 (`options.team.tmuxVisualization`)
 - [ ] 재시작/크래시 복구에서 락 충돌 대응이 제한적
 - [ ] 고급 관측 지표(Queue length, 실행 시간분포, 승인 대기시간) 미구현
 
