@@ -1,0 +1,352 @@
+:root {
+  --bg: #09131f;
+  --bg-soft: #111f31;
+  --panel: rgba(11, 23, 37, 0.84);
+  --line: rgba(142, 185, 231, 0.28);
+  --text: #e8f4ff;
+  --muted: #9cc0e2;
+  --accent: #5ce0be;
+  --warn: #ffbb67;
+  --danger: #ff6f6f;
+  --mono: "IBM Plex Mono", "SF Mono", Menlo, Consolas, monospace;
+  --sans: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(circle at 8% -5%, #1f405f 0%, transparent 32%),
+    radial-gradient(circle at 100% 0%, #183f36 0%, transparent 38%),
+    linear-gradient(170deg, var(--bg) 0%, #06111d 100%);
+  color: var(--text);
+  font-family: var(--sans);
+}
+
+.bg-shape {
+  position: fixed;
+  pointer-events: none;
+  opacity: 0.36;
+  filter: blur(52px);
+  z-index: 0;
+}
+
+.bg-shape-a {
+  top: -120px;
+  left: -160px;
+  width: 360px;
+  height: 360px;
+  background: #2976b8;
+}
+
+.bg-shape-b {
+  right: -120px;
+  bottom: -140px;
+  width: 360px;
+  height: 360px;
+  background: #24aa8f;
+}
+
+.shell {
+  position: relative;
+  z-index: 1;
+  width: min(1200px, 100% - 2rem);
+  margin: 1.2rem auto 2rem auto;
+  display: grid;
+  gap: 1rem;
+}
+
+.page-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+  padding: 1rem 1.1rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  backdrop-filter: blur(8px);
+}
+
+.eyebrow {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 0.3rem 0;
+  font-size: clamp(1.4rem, 2.4vw, 2rem);
+}
+
+.subline {
+  margin: 0;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+.head-controls {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+}
+
+button {
+  border: 1px solid var(--line);
+  background: linear-gradient(160deg, #1f3956, #173148);
+  color: var(--text);
+  border-radius: 9px;
+  padding: 0.45rem 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: #9ccbf8;
+}
+
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.7rem;
+}
+
+.kpi-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 0.9rem 1rem;
+}
+
+.kpi-card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.kpi-card strong {
+  display: block;
+  margin-top: 0.42rem;
+  font-size: 1.4rem;
+  letter-spacing: 0.02em;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 0.8rem 1rem 1rem 1rem;
+}
+
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.panel-head p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.table-wrap {
+  margin-top: 0.65rem;
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 620px;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.5rem 0.45rem;
+  border-bottom: 1px solid rgba(156, 192, 226, 0.15);
+  vertical-align: top;
+}
+
+th {
+  color: var(--muted);
+  font-size: 0.77rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+td {
+  font-size: 0.88rem;
+}
+
+tbody tr.job-row {
+  cursor: pointer;
+}
+
+tbody tr.job-row:hover {
+  background: rgba(92, 224, 190, 0.08);
+}
+
+tbody tr.job-row.selected {
+  background: rgba(92, 224, 190, 0.16);
+}
+
+.empty {
+  color: var(--muted);
+}
+
+.split {
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: 1.5fr 1fr;
+}
+
+.token-list {
+  margin: 0.6rem 0 0 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.7rem;
+}
+
+.token-list div {
+  padding: 0.65rem;
+  border: 1px solid rgba(156, 192, 226, 0.18);
+  border-radius: 10px;
+  background: rgba(15, 31, 47, 0.42);
+}
+
+.token-list dt {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.token-list dd {
+  margin: 0.35rem 0 0 0;
+  font-family: var(--mono);
+  font-size: 0.95rem;
+}
+
+.drill-grid {
+  margin-top: 0.7rem;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.8rem;
+}
+
+.drill-block h3 {
+  margin: 0 0 0.45rem 0;
+  font-size: 0.9rem;
+}
+
+pre {
+  margin: 0;
+  padding: 0.7rem;
+  border-radius: 10px;
+  background: rgba(4, 10, 16, 0.65);
+  border: 1px solid rgba(156, 192, 226, 0.2);
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  overflow: auto;
+  max-height: 320px;
+}
+
+.events {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.45rem;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.events li {
+  border: 1px solid rgba(156, 192, 226, 0.17);
+  border-radius: 10px;
+  padding: 0.45rem 0.55rem;
+  background: rgba(12, 25, 38, 0.44);
+}
+
+.events .when {
+  display: block;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  margin-bottom: 0.18rem;
+}
+
+.events .event-type {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--accent);
+}
+
+.status-pill {
+  display: inline-block;
+  padding: 0.12rem 0.46rem;
+  border-radius: 999px;
+  border: 1px solid rgba(156, 192, 226, 0.3);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  text-transform: lowercase;
+}
+
+.status-pill.running {
+  color: var(--accent);
+  border-color: rgba(92, 224, 190, 0.45);
+}
+
+.status-pill.waiting_approval {
+  color: var(--warn);
+  border-color: rgba(255, 187, 103, 0.55);
+}
+
+.status-pill.failed,
+.status-pill.canceled {
+  color: var(--danger);
+  border-color: rgba(255, 111, 111, 0.55);
+}
+
+@media (max-width: 960px) {
+  .kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .split,
+  .drill-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 620px) {
+  .shell {
+    width: calc(100% - 1rem);
+  }
+
+  .page-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+

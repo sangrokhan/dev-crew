@@ -51,6 +51,23 @@ export class JobsController {
     return this.jobsService.getTeamState(jobId);
   }
 
+  @Get(':jobId/team/mailbox')
+  @ApiOperation({ summary: 'Get team mailbox messages for a team job' })
+  @ApiOkResponse({ description: 'Team mailbox snapshot' })
+  getTeamMailbox(@Param('jobId') jobId: string): Promise<unknown[]> {
+    return this.jobsService.getTeamMailbox(jobId);
+  }
+
+  @Post(':jobId/team/mailbox')
+  @HttpCode(201)
+  @ApiOperation({ summary: 'Send a message into team mailbox for rerun/reassignment workflow' })
+  sendTeamMailboxMessage(
+    @Param('jobId') jobId: string,
+    @Body() message: Record<string, unknown>,
+  ): Promise<unknown> {
+    return this.jobsService.sendTeamMailboxMessage(jobId, message);
+  }
+
   @Post(':jobId/actions/:action')
   @HttpCode(200)
   @ApiOperation({ summary: 'Apply approve/reject/cancel/resume action' })

@@ -41,6 +41,30 @@ const TMUX_ROLES: Role[] = ['planner', 'executor', 'verifier'];
 const TEAM_ROLES: TeamRole[] = ['planner', 'researcher', 'designer', 'developer', 'executor', 'verifier'];
 const TEAM_IDLE_BACKOFF_BASE_MS = Number(process.env.TEAM_IDLE_BACKOFF_BASE_MS ?? 800);
 const TEAM_IDLE_BACKOFF_MAX_MS = Number(process.env.TEAM_IDLE_BACKOFF_MAX_MS ?? 8_000);
+const JOB_LLM_RATE_LIMIT_RETRY_MAX_ATTEMPTS = (() => {
+  const raw = Number(process.env.JOB_LLM_RATE_LIMIT_RETRY_MAX_ATTEMPTS ?? 0);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 0;
+})();
+const JOB_LLM_RATE_LIMIT_RETRY_BASE_MS = (() => {
+  const raw = Number(process.env.JOB_LLM_RATE_LIMIT_RETRY_BASE_MS ?? 1_500);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1_500;
+})();
+const JOB_LLM_RATE_LIMIT_RETRY_MAX_MS = (() => {
+  const raw = Number(process.env.JOB_LLM_RATE_LIMIT_RETRY_MAX_MS ?? 60_000);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 60_000;
+})();
+const JOB_LLM_RETRY_MAX_ATTEMPTS = (() => {
+  const raw = Number(process.env.JOB_LLM_RETRY_MAX_ATTEMPTS ?? 0);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 0;
+})();
+const JOB_LLM_RETRY_BASE_MS = (() => {
+  const raw = Number(process.env.JOB_LLM_RETRY_BASE_MS ?? 1_000);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1_000;
+})();
+const JOB_LLM_RETRY_MAX_MS = (() => {
+  const raw = Number(process.env.JOB_LLM_RETRY_MAX_MS ?? 15_000);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 15_000;
+})();
 const TEAM_WORKER_ID = `worker-${process.pid}-${Math.random().toString(16).slice(2, 10)}`;
 const SHELL_COMMAND_PREFIXES = new Set([
   'bash',
@@ -88,6 +112,21 @@ interface TeamTaskState extends TeamTaskTemplate {
   output?: Record<string, unknown> | undefined;
 }
 
+type TeamMailboxKind = 'question' | 'instruction' | 'notice' | 'reassign';
+
+interface TeamMailboxMessage {
+  id: string;
+  kind: TeamMailboxKind;
+  to?: TeamRole | TeamRole[] | 'leader';
+  taskId?: string;
+  message: string;
+  payload?: Record<string, unknown>;
+  createdAt: string;
+  deliveredAt?: string | null;
+  delivered: boolean;
+  meta?: Record<string, unknown>;
+}
+
 interface TeamRunState {
   status: TeamRunStatus;
   phase: string;
@@ -96,6 +135,7 @@ interface TeamRunState {
   parallelTasks: number;
   currentTaskId?: string | null;
   tasks: TeamTaskState[];
+  mailbox?: TeamMailboxMessage[];
 }
 
 interface PaneRuntime {
@@ -150,6 +190,13 @@ function normalizeTaskStatus(raw: unknown): TeamTaskStatus {
 interface RunResult {
   state: 'succeeded' | 'canceled' | 'failed' | 'waiting_approval';
   output?: Record<string, unknown>;
+}
+
+type RetryFailureKind = 'rate_limit' | 'general';
+
+interface RetryFailure {
+  kind: RetryFailureKind;
+  retryAfterMs?: number;
 }
 
 interface TemplateContext {
@@ -293,6 +340,139 @@ function detectApprovalRequired(value: unknown): boolean {
   return false;
 }
 
+function withConfigurableBackoff(attempt: number, baseMs: number, maxMs: number): number {
+  const safeBase = clampPositiveInt(baseMs, 800);
+  const safeMax = clampPositiveInt(maxMs, 8_000);
+  const capped = Math.min(safeMax, safeBase * 2 ** Math.max(0, attempt));
+  const jitter = 0.75 + (Math.random() * 0.5);
+  const jittered = Math.floor(capped * jitter);
+  const floor = Math.min(200, capped);
+  const upper = Math.max(0, capped - floor);
+  const floorWithJitter = floor + Math.floor(upper * Math.random());
+
+  return Math.max(floor, jittered + floorWithJitter);
+}
+
+function parseNumericValue(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value)) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const parsed = Number.parseInt(value.trim(), 10);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
+function parseErrorCode(parsed: Record<string, unknown>): number | null {
+  const direct = parseNumericValue(parsed.code) ?? parseNumericValue(parsed.status) ?? parseNumericValue(parsed.statusCode);
+  if (direct !== null) {
+    return direct;
+  }
+
+  const details = asObject(parsed.details);
+  const nested = parseNumericValue(details.code) ?? parseNumericValue(details.status) ?? parseNumericValue(details.statusCode);
+  if (nested !== null) {
+    return nested;
+  }
+
+  const error = asObject(parsed.error);
+  return (
+    parseNumericValue(error.code)
+    ?? parseNumericValue(error.status)
+    ?? parseNumericValue(error.statusCode)
+    ?? null
+  );
+}
+
+function parseRetryAfterMs(payload: string): number | undefined {
+  const patterns = [
+    /retry[- ]?after\s*[:=]?\s*(\d+)\s*(ms|s|sec|secs|seconds|m|min|minutes)?/i,
+    /retry\s+after\s*[:=]?\s*(\d+)\s*(ms|s|sec|secs|seconds|m|min|minutes)?/i,
+    /retry\s+in\s*(\d+)\s*(ms|s|sec|secs|seconds|m|min|minutes)?/i,
+  ] as const;
+
+  for (const pattern of patterns) {
+    const match = payload.match(pattern);
+    if (!match) {
+      continue;
+    }
+
+    const rawDelay = Number.parseInt(match[1], 10);
+    if (!Number.isFinite(rawDelay) || rawDelay <= 0) {
+      continue;
+    }
+
+    const unit = match[2]?.toLowerCase() ?? 's';
+    if (unit === 'ms') {
+      return rawDelay;
+    }
+    if (unit === 'm' || unit === 'min' || unit === 'minutes') {
+      return rawDelay * 60_000;
+    }
+    return rawDelay * 1000;
+  }
+
+  const dateMatch = payload.match(
+    /retry[- ]?after[^0-9a-z]+([a-z]{3},\s+\d{1,2}\s+[a-z]{3}\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s+gmt)/i,
+  );
+  if (dateMatch) {
+    const dateValue = Date.parse(dateMatch[1]);
+    if (!Number.isNaN(dateValue)) {
+      const delay = dateValue - Date.now();
+      if (delay > 0) {
+        return delay;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function detectRateLimitFailure(parsed: Record<string, unknown> | undefined, payload: string): RetryFailure | null {
+  const parsedText = JSON.stringify(parsed ?? {});
+  const combined = `${payload}\n${parsedText}`.toLowerCase();
+  const errorCode = parseErrorCode(asObject(parsed ?? {}));
+
+  const isRateLimit = combined.includes('429')
+    || combined.includes('rate limit')
+    || combined.includes('too many requests')
+    || combined.includes('quota')
+    || combined.includes('throttle')
+    || errorCode === 429;
+
+  if (!isRateLimit) {
+    return null;
+  }
+
+  return {
+    kind: 'rate_limit',
+    retryAfterMs: parseRetryAfterMs(payload),
+  };
+}
+
+function getRetryMaxAttempts(task: TeamTaskState, kind: RetryFailureKind): number {
+  const baseline = task.maxAttempts ?? 1;
+  if (kind === 'rate_limit' && JOB_LLM_RATE_LIMIT_RETRY_MAX_ATTEMPTS > 0) {
+    return Math.max(baseline, JOB_LLM_RATE_LIMIT_RETRY_MAX_ATTEMPTS);
+  }
+  if (kind === 'general' && JOB_LLM_RETRY_MAX_ATTEMPTS > 0) {
+    return Math.max(baseline, JOB_LLM_RETRY_MAX_ATTEMPTS);
+  }
+  return baseline;
+}
+
+function getRetryDelayMs(attempt: number, kind: RetryFailureKind, retryAfterMs?: number): number {
+  if (kind === 'rate_limit') {
+    if (typeof retryAfterMs === 'number' && retryAfterMs > 0) {
+      return Math.min(retryAfterMs, JOB_LLM_RATE_LIMIT_RETRY_MAX_MS);
+    }
+    return withConfigurableBackoff(attempt - 1, JOB_LLM_RATE_LIMIT_RETRY_BASE_MS, JOB_LLM_RATE_LIMIT_RETRY_MAX_MS);
+  }
+
+  return withConfigurableBackoff(attempt - 1, JOB_LLM_RETRY_BASE_MS, JOB_LLM_RETRY_MAX_MS);
+}
+
 function withBackoffDelay(attempt: number): number {
   const safeBase = clampPositiveInt(TEAM_IDLE_BACKOFF_BASE_MS, 800);
   const safeMax = clampPositiveInt(TEAM_IDLE_BACKOFF_MAX_MS, 8_000);
@@ -411,6 +591,135 @@ function buildNormalizedTaskOutput(task: TeamTaskState, runner: CodexRunOutput) 
     output,
     requiresApproval: detectApprovalRequired(parsed),
   };
+}
+
+type PlannerOutputValidation = {
+  planSummary: string;
+  tasks: TeamTaskTemplate[];
+};
+
+function normalizeTeamRole(value: unknown): TeamRole | null {
+  if (
+    value === 'planner' ||
+    value === 'researcher' ||
+    value === 'designer' ||
+    value === 'developer' ||
+    value === 'executor' ||
+    value === 'verifier'
+  ) {
+    return value;
+  }
+
+  return null;
+}
+
+function parsePlannerOutput(value: unknown): PlannerOutputValidation | null {
+  const parsed = asObject(value);
+  const planSummary = typeof parsed.plan_summary === 'string' ? parsed.plan_summary.trim() : '';
+  if (!planSummary) {
+    return null;
+  }
+
+  const tasksRaw = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+  if (tasksRaw.length === 0) {
+    return null;
+  }
+
+  const taskIds = new Set<string>();
+  const tasks: TeamTaskTemplate[] = [];
+
+  for (const entry of tasksRaw) {
+    const source = asObject(entry);
+    const role = normalizeTeamRole(source.role);
+    if (!role) {
+      return null;
+    }
+
+    const subject = typeof source.subject === 'string' && source.subject.trim() ? source.subject.trim() : '';
+    const description = typeof source.description === 'string' && source.description.trim() ? source.description.trim() : '';
+    if (!subject && !description) {
+      return null;
+    }
+
+    const idRaw = typeof source.id === 'string' && source.id.trim() ? source.id.trim() : '';
+    const id = idRaw || `${role}-${subject.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` || `${role}-${tasks.length + 1}`;
+    if (taskIds.has(id)) {
+      return null;
+    }
+    taskIds.add(id);
+
+    const dependencySource = source.depends_on ?? source.dependencies;
+    const dependenciesRaw = Array.isArray(dependencySource) ? dependencySource : [];
+    const dependencies = dependenciesRaw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+
+    tasks.push({
+      id,
+      name: subject || description,
+      role,
+      dependencies,
+      maxAttempts: typeof source.maxAttempts === 'number' && source.maxAttempts > 0 ? Math.floor(source.maxAttempts) : 1,
+      timeoutSeconds:
+        typeof source.timeoutSeconds === 'number' && source.timeoutSeconds > 0 ? Math.floor(source.timeoutSeconds) : 1200,
+    });
+  }
+
+  const idSet = new Set(tasks.map((task) => task.id));
+  for (const task of tasks) {
+    for (const dependency of task.dependencies ?? []) {
+      if (!idSet.has(dependency)) {
+        return null;
+      }
+    }
+  }
+
+  const visit = new Map<string, 'unvisited' | 'visiting' | 'visited'>();
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+
+  function hasCycle(taskId: string): boolean {
+    const state = visit.get(taskId) ?? 'unvisited';
+    if (state === 'visiting') {
+      return true;
+    }
+    if (state === 'visited') {
+      return false;
+    }
+
+    visit.set(taskId, 'visiting');
+    const task = byId.get(taskId);
+    if (!task) {
+      visit.set(taskId, 'visited');
+      return false;
+    }
+
+    for (const dependency of task.dependencies ?? []) {
+      if (hasCycle(dependency)) {
+        return true;
+      }
+    }
+
+    visit.set(taskId, 'visited');
+    return false;
+  }
+
+  for (const id of idSet) {
+    if (hasCycle(id)) {
+      return null;
+    }
+  }
+
+  return {
+    planSummary,
+    tasks,
+  };
+}
+
+function parseVerifierResult(value: unknown): 'pass' | 'fail' | null {
+  const parsed = asObject(value);
+  const status = parsed.status;
+  if (status !== 'pass' && status !== 'fail') {
+    return null;
+  }
+  return status;
 }
 
 function lockTaskForExecution(task: TeamTaskState): Partial<TeamTaskState> {
@@ -1051,6 +1360,7 @@ function seedTeamStateFromOptions(options: Record<string, unknown> | null): Team
       maxFixAttempts: toNonNegativeInt(state.maxFixAttempts, toNonNegativeInt(asObject(team).maxFixAttempts, 1)),
       parallelTasks: Math.max(1, toPositiveInt(state.parallelTasks, toPositiveInt(asObject(team).parallelTasks, 1))),
       currentTaskId: typeof state.currentTaskId === 'string' ? state.currentTaskId : null,
+      mailbox: normalizeMailboxMessages(state.mailbox),
       tasks: persistedTasks,
     };
   }
@@ -1062,6 +1372,7 @@ function seedTeamStateFromOptions(options: Record<string, unknown> | null): Team
     fixAttempts: 0,
     maxFixAttempts: toNonNegativeInt(asObject(team).maxFixAttempts, 2),
     parallelTasks: Math.max(1, toPositiveInt(asObject(team).parallelTasks, 1)),
+    mailbox: [],
     tasks: normalized,
   };
 }
@@ -1087,11 +1398,13 @@ async function readTeamState(job: JobRecord): Promise<TeamRunState> {
     maxFixAttempts: toNonNegativeInt(state.maxFixAttempts, seed.maxFixAttempts),
     parallelTasks: Math.max(1, toPositiveInt(state.parallelTasks, seed.parallelTasks)),
     currentTaskId: typeof state.currentTaskId === 'string' ? state.currentTaskId : null,
+    mailbox: normalizeMailboxMessages(state.mailbox),
     tasks,
   };
 
   return {
     ...merged,
+    mailbox: normalizeMailboxMessages(state.mailbox),
     tasks: tasks.map((task, idx) => ({
       ...task,
       status:
@@ -1116,6 +1429,146 @@ function collectDependencyOutputs(task: TeamTaskState, tasks: TeamTaskState[]): 
   }
 
   return dependencyOutputs;
+}
+
+function normalizeMailboxMessages(value: unknown): TeamMailboxMessage[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const mapped: Array<TeamMailboxMessage | null> = value.map((raw, index): TeamMailboxMessage | null => {
+      const item = asObject(raw);
+      const kind = item.kind;
+      const message = typeof item.message === 'string' && item.message.trim() ? item.message.trim() : '';
+      const delivered =
+        typeof item.delivered === 'boolean'
+          ? item.delivered
+          : typeof item.deliveredAt === 'string' && item.deliveredAt.trim().length > 0;
+
+      if (!['question', 'instruction', 'notice', 'reassign'].includes(String(kind))) {
+        return null;
+      }
+
+      const createdAt = typeof item.createdAt === 'string' && item.createdAt.trim() ? item.createdAt : toISOStringNow();
+      const deliveredAt = typeof item.deliveredAt === 'string' && item.deliveredAt.trim() ? item.deliveredAt : null;
+      const taskId = typeof item.taskId === 'string' && item.taskId.trim() ? item.taskId.trim() : undefined;
+      const rawTo = item.to;
+      const validTo: TeamMailboxMessage['to'] =
+        rawTo === 'leader' || rawTo === 'planner' || rawTo === 'researcher' || rawTo === 'designer' || rawTo === 'developer' || rawTo === 'executor' || rawTo === 'verifier'
+          ? rawTo
+          : Array.isArray(rawTo) && rawTo.every((entry) => entry === 'planner' || entry === 'researcher' || entry === 'designer' || entry === 'developer' || entry === 'executor' || entry === 'verifier')
+            ? (rawTo as TeamRole[])
+            : undefined;
+
+      if (!message) {
+        return null;
+      }
+
+      const normalized: TeamMailboxMessage = {
+        id: typeof item.id === 'string' && item.id.trim() ? item.id.trim() : `mailbox-${Date.now().toString(36)}-${index}`,
+        kind: kind as TeamMailboxKind,
+        taskId,
+        message,
+        payload: asObject(item.payload),
+        createdAt,
+        deliveredAt,
+        delivered,
+        meta: asObject(item.meta),
+      };
+
+      if (validTo !== undefined) {
+        normalized.to = validTo;
+      }
+
+      return normalized;
+    });
+
+  return mapped
+    .filter((item): item is TeamMailboxMessage => item !== null)
+    .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
+}
+
+async function applyMailboxReassign(
+  jobId: string,
+  state: TeamRunState,
+): Promise<{ state: TeamRunState; changed: boolean; hasUndeliveredMessages: boolean }> {
+  const queue = Array.isArray(state.mailbox) ? [...state.mailbox] : [];
+  let changed = false;
+  let hasUndeliveredMessages = false;
+  let nextTasks = state.tasks;
+  const nextMailbox = queue.map((message) => {
+    if (message.delivered) {
+      return message;
+    }
+
+    hasUndeliveredMessages = true;
+
+    if (message.kind !== 'reassign' || !message.taskId) {
+      return {
+        ...message,
+        delivered: true,
+        deliveredAt: toISOStringNow(),
+      };
+    }
+
+    let reassigned = false;
+    nextTasks = nextTasks.map((task) => {
+      if (task.id !== message.taskId || reassigned) {
+        return task;
+      }
+
+      const updatedStatus = task.dependencies?.length && !isTaskReady(task, state.tasks) ? ('blocked' as TeamTaskStatus) : ('queued' as TeamTaskStatus);
+      changed = true;
+      reassigned = true;
+
+      addEvent(jobId, 'team.task.reassigned', `Task ${task.id} reassigned by mailbox instruction`, {
+        taskId: task.id,
+        role: task.role,
+        reason: message.message,
+      }).catch(() => undefined);
+
+      return {
+        ...task,
+        status: updatedStatus,
+        attempt: 0,
+        error: `Task re-assigned by mail instruction: ${message.message}`,
+        workerId: undefined,
+        claimToken: undefined,
+        claimExpiresAt: undefined,
+        lastHeartbeatAt: undefined,
+      };
+    });
+
+    return {
+      ...message,
+      delivered: true,
+      deliveredAt: toISOStringNow(),
+    };
+  });
+
+  if (!hasUndeliveredMessages) {
+    return {
+      state,
+      changed: false,
+      hasUndeliveredMessages: false,
+    };
+  }
+
+  const unresolved = queue.map((message) => ({
+    ...message,
+    delivered: true,
+    deliveredAt: message.deliveredAt ?? toISOStringNow(),
+  }));
+
+  return {
+    state: {
+      ...state,
+      mailbox: unresolved,
+      tasks: nextTasks,
+    },
+    changed,
+    hasUndeliveredMessages: true,
+  };
 }
 
 function normalizeTaskForRead(task: TeamTaskState, tasks: TeamTaskState[]): TeamTaskStatus {
@@ -1343,102 +1796,150 @@ async function executeTeamTask(
   workspaceDir: string,
 ): Promise<TeamTaskExecutionResult> {
   const commandTemplate = resolveRoleCommand(job.provider, task.role, options.agentCommands);
-  const command = applyTemplate(commandTemplate, {
-    jobId: job.id,
-    provider: job.provider,
-    mode: job.mode,
-    repo: job.repo,
-    ref: job.ref,
-    role: task.role,
-    task: `${task.name}\n${task.role} objective:\n${job.task}`,
-    taskId: task.id,
-    phase,
-    attempt: task.attempt,
-    workdir: workspaceDir,
-    dependencyOutputs: summarizeValueForTemplate(collectDependencyOutputs(task, allTasks)),
-  });
+  let currentAttempt = task.attempt;
 
-  await addEvent(job.id, 'team.task.started', `Role=${task.role} task=${task.id} attempt=${task.attempt}`, {
+  await addEvent(job.id, 'team.task.started', `Role=${task.role} task=${task.id} attempt=${currentAttempt}`, {
     taskId: task.id,
     role: task.role,
-    attempt: task.attempt,
+    attempt: currentAttempt,
   });
 
-  const runner = runCodexCommand(
-    job.provider,
-    command,
-    workspaceDir,
-    Math.max(30_000, (task.timeoutSeconds ?? 1200) * 1000),
-  );
-  const normalized = buildNormalizedTaskOutput(task, runner);
-
-  if (normalized.requiresApproval) {
-    await addEvent(job.id, 'team.task.approval_required', `${task.id} requested approval`, {
-      taskId: task.id,
-      role: task.role,
-      attempt: task.attempt,
-      output: normalized.output,
-    });
-
-    return {
-      taskId: task.id,
-      requiresApproval: true,
-      patch: {
-        status: 'queued',
-        attempt: task.attempt,
-        error: 'Task output requested approval before continuing.',
-        output: normalized.output,
-        finishedAt: new Date().toISOString(),
-        workerId: undefined,
-        claimToken: undefined,
-        claimExpiresAt: undefined,
-        lastHeartbeatAt: undefined,
-      },
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const taskForAttempt = {
+      ...task,
+      attempt: currentAttempt,
     };
-  }
 
-  if (runner.status !== 0 && task.attempt < (task.maxAttempts ?? 1)) {
-    await addEvent(job.id, 'team.task.retry', `${task.id} failed; scheduling retry`, {
-      taskId: task.id,
+    const command = applyTemplate(commandTemplate, {
+      jobId: job.id,
+      provider: job.provider,
+      mode: job.mode,
+      repo: job.repo,
+      ref: job.ref,
       role: task.role,
-      attempt: task.attempt,
-      maxAttempts: task.maxAttempts ?? 1,
-    });
-    await addEvent(job.id, 'team.task.completed', `${task.id} completed with retry`, {
+      task: `${task.name}\n${task.role} objective:\n${job.task}`,
       taskId: task.id,
-      role: task.role,
-      attempt: task.attempt,
-      status: 'queued',
+      phase,
+      attempt: currentAttempt,
+      workdir: workspaceDir,
+      dependencyOutputs: summarizeValueForTemplate(collectDependencyOutputs(task, allTasks)),
     });
-    return {
-      taskId: task.id,
-      patch: {
-        status: 'queued',
-        attempt: task.attempt,
-        error: `${runner.stderr || runner.stdout}`.slice(0, 4000),
+
+    const runner = runCodexCommand(
+      job.provider,
+      command,
+      workspaceDir,
+      Math.max(30_000, (task.timeoutSeconds ?? 1200) * 1000),
+    );
+    const normalized = buildNormalizedTaskOutput(taskForAttempt, runner);
+    const plannerValidation = task.role === 'planner' ? parsePlannerOutput(normalized.output.parsed) : null;
+    const verifierStatus = task.role === 'verifier' ? parseVerifierResult(normalized.output.parsed) : null;
+    const validationError =
+      task.role === 'planner'
+        ? (plannerValidation ? undefined : 'Planner output did not match required JSON schema')
+        : verifierStatus === 'fail'
+          ? 'Verifier reported status=fail'
+          : undefined;
+
+    if (validationError) {
+      await addEvent(job.id, 'team.task.validation_failed', `${task.id} validation failed`, {
+        taskId: task.id,
+        role: task.role,
+        attempt: currentAttempt,
+        reason: validationError,
         output: normalized.output,
-        finishedAt: new Date().toISOString(),
-        workerId: undefined,
-        claimToken: undefined,
-        claimExpiresAt: undefined,
-        lastHeartbeatAt: undefined,
-      },
-    };
-  }
+      });
+    }
 
-  if (runner.status !== 0) {
+    if (normalized.requiresApproval) {
+      await addEvent(job.id, 'team.task.approval_required', `${task.id} requested approval`, {
+        taskId: task.id,
+        role: task.role,
+        attempt: currentAttempt,
+        output: normalized.output,
+      });
+
+      return {
+        taskId: task.id,
+        requiresApproval: true,
+        patch: {
+          status: 'queued',
+          attempt: currentAttempt,
+          error: 'Task output requested approval before continuing.',
+          output: normalized.output,
+          finishedAt: new Date().toISOString(),
+          workerId: undefined,
+          claimToken: undefined,
+          claimExpiresAt: undefined,
+          lastHeartbeatAt: undefined,
+        },
+      };
+    }
+
+    const hasExecutionFailure = runner.status !== 0 || Boolean(validationError);
+    const retryFailure = hasExecutionFailure
+      ? detectRateLimitFailure(asObject(normalized.output.parsed), `${runner.stderr}\n${runner.stdout}`)
+      : null;
+    const failureKind: RetryFailureKind = retryFailure?.kind ?? 'general';
+    const retryMaxAttempts = hasExecutionFailure ? getRetryMaxAttempts(taskForAttempt, failureKind) : 0;
+
+    if (!hasExecutionFailure) {
+      await addEvent(job.id, 'team.task.completed', `${task.id} succeeded`, {
+        taskId: task.id,
+        role: task.role,
+        attempt: currentAttempt,
+        status: 'succeeded',
+      });
+      return {
+        taskId: task.id,
+        patch: {
+          status: 'succeeded',
+          attempt: currentAttempt,
+          output: normalized.output,
+          finishedAt: new Date().toISOString(),
+          workerId: undefined,
+          claimToken: undefined,
+          claimExpiresAt: undefined,
+          lastHeartbeatAt: undefined,
+        },
+      };
+    }
+
+    if (currentAttempt < retryMaxAttempts) {
+      const delayMs = getRetryDelayMs(currentAttempt, failureKind, retryFailure?.retryAfterMs);
+      await addEvent(job.id, 'team.task.retry', `${task.id} failed; scheduling retry`, {
+        taskId: task.id,
+        role: task.role,
+        attempt: currentAttempt,
+        kind: failureKind,
+        maxAttempts: retryMaxAttempts,
+        retryAfterMs: retryFailure?.retryAfterMs,
+        delayMs,
+      });
+      await addEvent(job.id, 'team.task.completed', `${task.id} completed with retry`, {
+        taskId: task.id,
+        role: task.role,
+        attempt: currentAttempt,
+        status: 'queued',
+      });
+      await sleep(delayMs);
+      currentAttempt += 1;
+      continue;
+    }
+
     await addEvent(job.id, 'team.task.completed', `${task.id} failed`, {
       taskId: task.id,
       role: task.role,
-      attempt: task.attempt,
+      attempt: currentAttempt,
       status: 'failed',
     });
     return {
       taskId: task.id,
       patch: {
         status: 'failed',
-        attempt: task.attempt,
-        error: `${runner.stderr || runner.stdout}`.slice(0, 4000),
+        attempt: currentAttempt,
+        error: validationError ?? `${runner.stderr || runner.stdout}`.slice(0, 4000),
         output: normalized.output,
         finishedAt: new Date().toISOString(),
         workerId: undefined,
@@ -1448,27 +1949,6 @@ async function executeTeamTask(
       },
     };
   }
-
-  await addEvent(job.id, 'team.task.completed', `${task.id} succeeded`, {
-    taskId: task.id,
-    role: task.role,
-    attempt: task.attempt,
-    status: 'succeeded',
-  });
-
-  return {
-    taskId: task.id,
-    patch: {
-      status: 'succeeded',
-      attempt: task.attempt,
-      output: normalized.output,
-      finishedAt: new Date().toISOString(),
-      workerId: undefined,
-      claimToken: undefined,
-      claimExpiresAt: undefined,
-      lastHeartbeatAt: undefined,
-    },
-  };
 }
 
 async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
@@ -1505,8 +1985,10 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
     const normalizedClaims = normalizeRunningClaims(current);
     const refreshedState = refreshRunningClaims(normalizedClaims);
     state = refreshedState;
+    const mailboxResult = await applyMailboxReassign(job.id, state);
+    state = mailboxResult.state;
 
-    if (JSON.stringify(normalizedClaims) !== JSON.stringify(refreshedState)) {
+    if (JSON.stringify(normalizedClaims) !== JSON.stringify(refreshedState) || mailboxResult.hasUndeliveredMessages) {
       const claimRecoveredTaskIds = state.tasks
         .filter((task) => task.status === 'queued' || task.status === 'blocked')
         .map((task) => task.id);

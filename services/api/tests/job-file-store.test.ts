@@ -260,4 +260,38 @@ describe('api JobFileStore', () => {
     assert.equal(updated.status, 'running');
     assert.equal(existsSync(lockPath), false);
   });
+
+  test('lists jobs by status with descending updatedAt order', async () => {
+    const store = new JobFileStore();
+    const a = await store.createJob(
+      {
+        provider: 'codex',
+        mode: 'team',
+        repo: 'git@github.com:example/repo.git',
+        ref: 'main',
+        task: 'first',
+      } as CreateInput as never,
+      'none',
+    );
+    const b = await store.createJob(
+      {
+        provider: 'gemini',
+        mode: 'pipeline',
+        repo: 'git@github.com:example/repo.git',
+        ref: 'main',
+        task: 'second',
+      } as CreateInput as never,
+      'none',
+    );
+
+    await store.updateJob(a.id, { status: 'running' });
+    await store.updateJob(b.id, { status: 'succeeded' });
+
+    const running = await store.listJobs({ statuses: ['running'] });
+    assert.equal(running.length, 1);
+    assert.equal(running[0].id, a.id);
+
+    const limited = await store.listJobs({ limit: 1 });
+    assert.equal(limited.length, 1);
+  });
 });

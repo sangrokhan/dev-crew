@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, test } from 'node:test';
 
 import { QueueService } from '../src/queue/queue.service';
-import { JobsService } from '../src/jobs/jobs.service';
+import { extractTokenUsage, JobsService } from '../src/jobs/jobs.service';
 
 type QueuedJob = {
   jobId: string;
@@ -118,6 +118,157 @@ describe('JobsService', () => {
       task: 'single mode',
     } as never);
     await assert.rejects(() => holder.service.getTeamState(job.id), /not a team job/);
+    holder.restore();
+  });
+
+  test('getTeamMailbox returns mailbox list for team job', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git@github.com:example/repo.git',
+      ref: 'main',
+      task: 'team mailbox read',
+    } as never);
+
+    await holder.service.sendTeamMailboxMessage(job.id, {
+      kind: 'reassign',
+      message: 'rerun planner',
+      taskId: 'team-planner',
+      to: 'planner',
+    } as never);
+
+    const mailbox = (await holder.service.getTeamMailbox(job.id)) as Array<{ kind: string; taskId: string; to: string }>;
+    assert.equal(mailbox.length, 1);
+    assert.equal(mailbox[0].kind, 'reassign');
+    assert.equal(mailbox[0].taskId, 'team-planner');
+    assert.equal(mailbox[0].to, 'planner');
+    holder.restore();
+  });
+
+  test('sendTeamMailboxMessage rejects invalid mailbox payload', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git@github.com:example/repo.git',
+      ref: 'main',
+      task: 'team mailbox validate',
+    } as never);
+
+    await assert.rejects(
+      () =>
+        holder.service.sendTeamMailboxMessage(job.id, {
+          kind: 'notice',
+        } as never),
+      /Invalid mailbox message payload/,
+    );
+    holder.restore();
+  });
+
+  test('sendTeamMailboxMessage rejects unknown mailbox kind', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git@github.com:example/repo.git',
+      ref: 'main',
+      task: 'team mailbox invalid kind',
+    } as never);
+
+    await assert.rejects(
+      () =>
+        holder.service.sendTeamMailboxMessage(job.id, {
+          kind: 'invalid-kind',
+          message: 'bad message',
+        } as never),
+      /Invalid mailbox message payload/,
+    );
+    holder.restore();
+  });
+
+  test('sendTeamMailboxMessage defaults optional fields and stores normalized message', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git@github.com:example/repo.git',
+      ref: 'main',
+      task: 'team mailbox defaults',
+    } as never);
+
+    const sent = (await holder.service.sendTeamMailboxMessage(job.id, {
+      kind: 'question',
+      message: 'status check',
+    } as never)) as {
+      id: string;
+      delivered: boolean;
+      deliveredAt: string | null;
+    };
+
+    assert.equal(sent.delivered, false);
+    assert.equal(sent.deliveredAt, null);
+    assert.equal(sent.id.startsWith('question-'), true);
+
+    const mailbox = (await holder.service.getTeamMailbox(job.id)) as Array<{ id: string; delivered: boolean; deliveredAt: string | null }>;
+    assert.equal(mailbox.length, 1);
+    assert.equal(mailbox[0].id, sent.id);
+    assert.equal(mailbox[0].delivered, false);
+    assert.equal(mailbox[0].deliveredAt, null);
+    holder.restore();
+  });
+
+  test('getTeamMailbox normalizes and sorts mailbox messages by createdAt', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git@github.com:example/repo.git',
+      ref: 'main',
+      task: 'team mailbox sort normalize',
+    } as never);
+
+    const store = (holder.service as never as {
+      store: {
+        updateJob: (jobId: string, patch: Record<string, unknown>) => Promise<unknown>;
+      };
+    }).store;
+
+    await store.updateJob(job.id, {
+      options: {
+        team: {
+          state: {
+            mailbox: [
+              { kind: 'notice', message: 'later', createdAt: '2026-02-20T00:05:00.000Z' },
+              { kind: 'question', message: 'first', createdAt: '2026-02-20T00:01:00.000Z', taskId: 'team-planner', to: 'planner' },
+              { kind: 'invalid-kind', message: 'ignore-this', createdAt: '2026-02-20T00:02:00.000Z' },
+              { kind: 'reassign', message: 'last', createdAt: '2026-02-20T00:10:00.000Z', taskId: 'team-planner', to: 'team-planner' },
+            ],
+          },
+        },
+      } as never,
+    });
+
+    const mailbox = (await holder.service.getTeamMailbox(job.id)) as Array<{ message: string; createdAt: string }>;
+    assert.equal(mailbox.length, 3);
+    assert.equal(mailbox[0].message, 'first');
+    assert.equal(mailbox[1].message, 'later');
+    assert.equal(mailbox[2].message, 'last');
+    assert.equal(mailbox[1].createdAt, '2026-02-20T00:05:00.000Z');
+    holder.restore();
+  });
+
+  test('getTeamMailbox is forbidden for non-team jobs', async () => {
+    const holder = await createService(stateRoot);
+    const job = await holder.service.createJob({
+      provider: 'gemini',
+      mode: 'autopilot',
+      repo: 'git@github.com:example/repo.git',
+      ref: 'main',
+      task: 'autopilot mailbox',
+    } as never);
+
+    await assert.rejects(() => holder.service.getTeamMailbox(job.id), /not a team job/);
     holder.restore();
   });
 
@@ -349,6 +500,99 @@ describe('JobsService', () => {
     const events = await holder.service.listRecentEvents(job.id, 3);
     assert.equal(events.length >= 1, true);
     assert.equal(events[0].message, 'Job queued');
+    holder.restore();
+  });
+
+  test('extractTokenUsage supports structured formats and total fallback', () => {
+    const usageA = extractTokenUsage({ usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } });
+    assert.equal(usageA?.inputTokens, 10);
+    assert.equal(usageA?.outputTokens, 4);
+    assert.equal(usageA?.totalTokens, 14);
+
+    const usageB = extractTokenUsage({ token_usage: { input: 7, output: 3 } });
+    assert.equal(usageB?.inputTokens, 7);
+    assert.equal(usageB?.outputTokens, 3);
+    assert.equal(usageB?.totalTokens, 10);
+
+    const usageC = extractTokenUsage({ message: 'no usage' });
+    assert.equal(usageC, null);
+  });
+
+  test('getMonitorOverview aggregates active jobs, active agents, and tokens', async () => {
+    const holder = await createService(stateRoot);
+    const teamJob = await holder.service.createJob({
+      provider: 'codex',
+      mode: 'team',
+      repo: 'git@github.com:example/repo.git',
+      ref: 'main',
+      task: 'team monitor',
+    } as never);
+    const providerJob = await holder.service.createJob({
+      provider: 'gemini',
+      mode: 'autopilot',
+      repo: 'git@github.com:example/repo.git',
+      ref: 'main',
+      task: 'provider monitor',
+    } as never);
+
+    const now = new Date().toISOString();
+    const store = (holder.service as never as {
+      store: {
+        updateJob: (jobId: string, patch: Record<string, unknown>) => Promise<unknown>;
+      };
+    }).store;
+
+    await store.updateJob(teamJob.id, {
+      status: 'running',
+      options: {
+        team: {
+          state: {
+            status: 'running',
+            phase: 'developer',
+            currentTaskId: 'task-dev-1',
+            tasks: [
+              {
+                id: 'task-dev-1',
+                name: 'Implement monitor',
+                role: 'developer',
+                status: 'running',
+                attempt: 1,
+                workerId: 'worker-dev-1',
+                startedAt: now,
+                lastHeartbeatAt: now,
+                claimExpiresAt: now,
+                output: {
+                  parsed: {
+                    usage: {
+                      input_tokens: 11,
+                      output_tokens: 5,
+                      total_tokens: 16,
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+    });
+    await store.updateJob(providerJob.id, {
+      status: 'queued',
+      output: {
+        usage: {
+          prompt_tokens: 3,
+          completion_tokens: 2,
+          total_tokens: 5,
+        },
+      },
+    });
+
+    const overview = await holder.service.getMonitorOverview(20);
+    assert.equal(overview.jobs.active >= 2, true);
+    assert.equal(overview.activeJobs.some((job) => job.id === teamJob.id), true);
+    assert.equal(overview.activeAgents.some((agent) => agent.jobId === teamJob.id), true);
+    assert.equal(overview.tokens.totalTokens >= 21, true);
+    assert.equal(overview.tokens.jobsWithUsage >= 2, true);
     holder.restore();
   });
 });

@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dev Crew Monitor</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="bg-shape bg-shape-a"></div>
+    <div class="bg-shape bg-shape-b"></div>
+    <main class="shell">
+      <header class="page-head">
+        <div>
+          <p class="eyebrow">OMX Web Orchestrator</p>
+          <h1>Live Monitor</h1>
+          <p id="refresh-note" class="subline">Waiting for first snapshot...</p>
+        </div>
+        <div class="head-controls">
+          <label class="toggle">
+            <input id="auto-refresh" type="checkbox" checked />
+            <span>Auto refresh</span>
+          </label>
+          <button id="refresh-now" type="button">Refresh now</button>
+        </div>
+      </header>
+
+      <section class="kpi-grid">
+        <article class="kpi-card">
+          <p>Active Jobs</p>
+          <strong id="kpi-active-jobs">0</strong>
+        </article>
+        <article class="kpi-card">
+          <p>Running Tasks</p>
+          <strong id="kpi-running-tasks">0</strong>
+        </article>
+        <article class="kpi-card">
+          <p>Waiting Approval</p>
+          <strong id="kpi-waiting-approval">0</strong>
+        </article>
+        <article class="kpi-card">
+          <p>Total Tokens</p>
+          <strong id="kpi-total-tokens">N/A</strong>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Active Jobs</h2>
+          <p id="jobs-summary">No data</p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Mode</th>
+                <th>Provider</th>
+                <th>Task</th>
+                <th>Updated</th>
+              </tr>
+            </thead>
+            <tbody id="active-jobs-body">
+              <tr><td colspan="5" class="empty">No active jobs.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="split">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Active Agents</h2>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Job</th>
+                  <th>Role</th>
+                  <th>Worker</th>
+                  <th>Status</th>
+                  <th>Heartbeat</th>
+                </tr>
+              </thead>
+              <tbody id="active-agents-body">
+                <tr><td colspan="5" class="empty">No active agents.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Token Usage</h2>
+          </div>
+          <dl class="token-list">
+            <div>
+              <dt>Input tokens</dt>
+              <dd id="tokens-input">N/A</dd>
+            </div>
+            <div>
+              <dt>Output tokens</dt>
+              <dd id="tokens-output">N/A</dd>
+            </div>
+            <div>
+              <dt>Total tokens</dt>
+              <dd id="tokens-total">N/A</dd>
+            </div>
+            <div>
+              <dt>Jobs with usage</dt>
+              <dd id="tokens-with">0</dd>
+            </div>
+            <div>
+              <dt>Jobs without usage</dt>
+              <dd id="tokens-without">0</dd>
+            </div>
+          </dl>
+        </section>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Job Drilldown</h2>
+          <p id="selected-job-label">Select an active job to inspect details.</p>
+        </div>
+        <div class="drill-grid">
+          <div class="drill-block">
+            <h3>Team State</h3>
+            <pre id="team-state-view">N/A</pre>
+          </div>
+          <div class="drill-block">
+            <h3>Event Timeline</h3>
+            <ul id="events-list" class="events">
+              <li class="empty">No events yet.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
+

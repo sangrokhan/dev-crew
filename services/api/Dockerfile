@@ -29,6 +29,7 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/config ./config
 COPY --from=builder /app/services/api/package.json ./services/api/package.json
 COPY --from=builder /app/services/api/dist ./services/api/dist
+COPY --from=builder /app/services/api/public ./services/api/public
 
 EXPOSE 8080
 CMD ["node", "services/api/dist/main.js"]

@@ -2,7 +2,7 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { QueueService } from '../queue/queue.service';
 import { CreateJobDto } from './dto/create-job.dto';
 import { JobAction, JobRecord, JobStatus, TeamRole } from './job.types';
-import { JobFileStore } from './storage/job-store';
+import { JobFileStore, ListJobsOptions } from './storage/job-store';
 
 type TeamTaskStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'blocked' | 'canceled';
 type TeamRunStatus = 'queued' | 'running' | 'waiting_approval' | 'succeeded' | 'failed' | 'canceled';
@@ -22,6 +22,10 @@ interface TeamTaskState extends TeamTaskTemplate {
   attempt: number;
   startedAt?: string;
   finishedAt?: string;
+  workerId?: string;
+  claimToken?: string;
+  claimExpiresAt?: string;
+  lastHeartbeatAt?: string;
   error?: string | null;
   output?: TeamTaskOutput;
 }
@@ -34,6 +38,22 @@ interface TeamRunState {
   maxFixAttempts: number;
   parallelTasks: number;
   tasks: TeamTaskState[];
+  mailbox?: TeamMailboxMessage[];
+}
+
+type TeamMailboxKind = 'question' | 'instruction' | 'notice' | 'reassign';
+
+interface TeamMailboxMessage {
+  id: string;
+  kind: TeamMailboxKind;
+  to?: TeamRole | TeamRole[] | 'leader';
+  taskId?: string;
+  message: string;
+  payload?: TeamTaskOutput;
+  createdAt: string;
+  deliveredAt?: string | null;
+  delivered: boolean;
+  meta?: Record<string, unknown>;
 }
 
 interface TeamTaskMetrics {
@@ -47,6 +67,51 @@ interface TeamTaskMetrics {
   terminal: number;
 }
 
+export interface TokenUsage {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+}
+
+export interface MonitorActiveAgent {
+  jobId: string;
+  taskId: string;
+  role: TeamRole;
+  workerId: string | null;
+  status: TeamTaskStatus;
+  startedAt: string | null;
+  lastHeartbeatAt: string | null;
+  claimExpiresAt: string | null;
+}
+
+export interface MonitorActiveJob {
+  id: string;
+  provider: JobRecord['provider'];
+  mode: JobRecord['mode'];
+  status: JobRecord['status'];
+  task: string;
+  repo: string;
+  ref: string;
+  startedAt?: string;
+  updatedAt: string;
+  teamPhase?: string;
+  teamMetrics?: TeamTaskMetrics;
+}
+
+export interface MonitorOverview {
+  generatedAt: string;
+  jobs: Record<JobStatus | 'active' | 'total', number>;
+  activeJobs: MonitorActiveJob[];
+  activeAgents: MonitorActiveAgent[];
+  tokens: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    jobsWithUsage: number;
+    jobsWithoutUsage: number;
+  };
+}
+
 const TERMINAL_STATUSES: JobStatus[] = ['succeeded', 'failed', 'canceled'];
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -54,6 +119,56 @@ function asRecord(value: unknown): Record<string, unknown> {
     return {};
   }
   return value as Record<string, unknown>;
+}
+
+function toTokenNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return Math.floor(parsed);
+    }
+  }
+  return null;
+}
+
+function pickTokenValue(record: Record<string, unknown>, keys: string[]): number | null {
+  for (const key of keys) {
+    const found = toTokenNumber(record[key]);
+    if (found !== null) {
+      return found;
+    }
+  }
+  return null;
+}
+
+export function extractTokenUsage(value: unknown): TokenUsage | null {
+  const root = asRecord(value);
+  const candidates = [root, asRecord(root.usage), asRecord(root.token_usage)];
+
+  for (const candidate of candidates) {
+    const inputTokens = pickTokenValue(candidate, ['input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens', 'input']);
+    const outputTokens = pickTokenValue(candidate, ['output_tokens', 'outputTokens', 'completion_tokens', 'completionTokens', 'output']);
+    let totalTokens = pickTokenValue(candidate, ['total_tokens', 'totalTokens', 'total']);
+
+    if (inputTokens === null && outputTokens === null && totalTokens === null) {
+      continue;
+    }
+
+    if (totalTokens === null && inputTokens !== null && outputTokens !== null) {
+      totalTokens = inputTokens + outputTokens;
+    }
+
+    return {
+      inputTokens,
+      outputTokens,
+      totalTokens,
+    };
+  }
+
+  return null;
 }
 
 function normalizeDependencies(raw: unknown): string[] {
@@ -93,6 +208,61 @@ function normalizeTeamRole(role: unknown): TeamRole | null {
     return role;
   }
   return null;
+}
+
+function randomMailboxMessageId(): string {
+  return `mailbox-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function normalizeTeamMailboxMessage(raw: unknown, defaultIdx: number): TeamMailboxMessage | null {
+  const item = asRecord(raw);
+  const kindCandidate = item.kind;
+  const message = typeof item.message === 'string' && item.message.trim() ? item.message.trim() : '';
+  if (!message) {
+    return null;
+  }
+
+  const kind = typeof kindCandidate === 'string' ? kindCandidate : '';
+  if (!['question', 'instruction', 'notice', 'reassign'].includes(kind)) {
+    return null;
+  }
+
+  const toCandidate = item.to;
+  const to =
+    toCandidate === 'leader'
+      ? 'leader'
+      : normalizeTeamRole(toCandidate)
+        ? (normalizeTeamRole(toCandidate) as TeamRole)
+        : Array.isArray(toCandidate) &&
+            toCandidate.every((entry) => normalizeTeamRole(entry) === entry)
+          ? (toCandidate as TeamRole[])
+          : undefined;
+
+  const taskId = typeof item.taskId === 'string' && item.taskId.trim() ? item.taskId.trim() : undefined;
+  return {
+    id:
+      typeof item.id === 'string' && item.id.trim() ? item.id.trim() : `${kind}-${Date.now().toString(36)}-${defaultIdx}`,
+    kind: kind as TeamMailboxKind,
+    to,
+    taskId,
+    message,
+    payload: asRecord(item.payload),
+    createdAt: typeof item.createdAt === 'string' && item.createdAt.trim() ? item.createdAt : new Date().toISOString(),
+    deliveredAt: typeof item.deliveredAt === 'string' && item.deliveredAt.trim() ? item.deliveredAt : null,
+    delivered: typeof item.delivered === 'boolean' ? item.delivered : false,
+    meta: asRecord(item.meta),
+  };
+}
+
+function normalizeTeamMailbox(raw: unknown): TeamMailboxMessage[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  return raw
+    .map((item, idx) => normalizeTeamMailboxMessage(item, idx))
+    .filter((message): message is TeamMailboxMessage => message !== null)
+    .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
 }
 
 function normalizeTaskTemplates(templates?: Array<Record<string, unknown>>): TeamTaskState[] {
@@ -230,6 +400,7 @@ function defaultTeamState(rawState?: Record<string, unknown>): TeamRunState {
     maxFixAttempts,
     parallelTasks,
     currentTaskId: null,
+    mailbox: [],
     tasks: taskSeed,
   };
 }
@@ -301,33 +472,176 @@ export class JobsService {
     return job;
   }
 
+  async listJobs(options: ListJobsOptions = {}): Promise<JobRecord[]> {
+    return this.store.listJobs(options);
+  }
+
   async getTeamState(jobId: string): Promise<Record<string, unknown>> {
     const job = await this.getJob(jobId);
     if (job.mode !== 'team') {
       throw new BadRequestException('not a team job');
     }
 
-    const options = asRecord(job.options);
-    const team = asRecord(options.team);
-    const rawState = asRecord(team.state);
-    if (!rawState.status || !Array.isArray(rawState.tasks)) {
-      const defaultState = defaultTeamState(team) as unknown as Record<string, unknown> & { tasks?: TeamTaskState[] };
-      return {
-        ...defaultState,
-        metrics: buildTeamTaskMetrics(defaultState.tasks as TeamTaskState[]),
-      } as Record<string, unknown>;
+    const state = this.extractJobTeamState(job);
+    const normalizedMailbox = normalizeTeamMailbox(state.mailbox);
+    const tasks = Array.isArray(state.tasks) ? state.tasks : [];
+    return {
+      ...state,
+      mailbox: normalizedMailbox,
+      metrics: buildTeamTaskMetrics(tasks),
+    } as Record<string, unknown>;
+  }
+
+  async getTeamMailbox(jobId: string): Promise<TeamMailboxMessage[]> {
+    const job = await this.getJob(jobId);
+    if (job.mode !== 'team') {
+      throw new BadRequestException('not a team job');
     }
 
-    const tasks = Array.isArray(rawState.tasks) ? (rawState.tasks as TeamTaskState[]) : [];
-    return {
-      ...(rawState as Record<string, unknown>),
-      metrics: buildTeamTaskMetrics(tasks),
+    const state = this.extractJobTeamState(job);
+    return normalizeTeamMailbox(state.mailbox);
+  }
+
+  async sendTeamMailboxMessage(jobId: string, message: Record<string, unknown>): Promise<TeamMailboxMessage> {
+    const job = await this.getJob(jobId);
+    if (job.mode !== 'team') {
+      throw new BadRequestException('not a team job');
+    }
+
+    const currentState = this.extractJobTeamState(job);
+    const normalized = normalizeTeamMailboxMessage(message, currentState.mailbox?.length ?? 0);
+    if (!normalized) {
+      throw new BadRequestException('Invalid mailbox message payload');
+    }
+
+    const nextState: TeamRunState = {
+      ...currentState,
+      mailbox: [
+        ...normalizeTeamMailbox(currentState.mailbox),
+        {
+          ...normalized,
+          id: normalized.id || randomMailboxMessageId(),
+          delivered: false,
+          deliveredAt: null,
+        },
+      ],
     };
+
+    await this.persistTeamState(jobId, nextState);
+    await this.addEvent(jobId, 'team.mailbox.received', `Mailbox message received for task ${normalized.taskId ?? 'none'}`, {
+      taskId: normalized.taskId,
+      kind: normalized.kind,
+      to: normalized.to,
+      message: normalized.message,
+    });
+    return normalized;
   }
 
   async listRecentEvents(jobId: string, take = 100) {
     await this.getJob(jobId);
     return this.store.listRecentEvents(jobId, take);
+  }
+
+  async getMonitorOverview(limit = 200): Promise<MonitorOverview> {
+    const safeLimit = Math.max(1, Math.min(2000, Math.floor(limit || 200)));
+    const jobs = await this.listJobs({ limit: safeLimit });
+    const activeStatuses: JobStatus[] = ['queued', 'running', 'waiting_approval'];
+
+    const counters = {
+      total: jobs.length,
+      queued: jobs.filter((job) => job.status === 'queued').length,
+      running: jobs.filter((job) => job.status === 'running').length,
+      waiting_approval: jobs.filter((job) => job.status === 'waiting_approval').length,
+      succeeded: jobs.filter((job) => job.status === 'succeeded').length,
+      failed: jobs.filter((job) => job.status === 'failed').length,
+      canceled: jobs.filter((job) => job.status === 'canceled').length,
+      active: jobs.filter((job) => activeStatuses.includes(job.status)).length,
+    };
+
+    const activeJobs: MonitorActiveJob[] = [];
+    const activeAgents: MonitorActiveAgent[] = [];
+
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let totalTokens = 0;
+    let jobsWithUsage = 0;
+    let jobsWithoutUsage = 0;
+
+    for (const job of jobs) {
+      const usage = this.collectJobTokenUsage(job);
+      if (usage) {
+        jobsWithUsage += 1;
+        inputTokens += usage.inputTokens ?? 0;
+        outputTokens += usage.outputTokens ?? 0;
+        totalTokens += usage.totalTokens ?? 0;
+      } else {
+        jobsWithoutUsage += 1;
+      }
+
+      if (!activeStatuses.includes(job.status)) {
+        continue;
+      }
+
+      if (job.mode === 'team') {
+        const teamState = this.extractJobTeamState(job);
+        const metrics = buildTeamTaskMetrics(teamState.tasks);
+        activeJobs.push({
+          id: job.id,
+          provider: job.provider,
+          mode: job.mode,
+          status: job.status,
+          task: job.task,
+          repo: job.repo,
+          ref: job.ref,
+          startedAt: job.startedAt,
+          updatedAt: job.updatedAt,
+          teamPhase: teamState.phase,
+          teamMetrics: metrics,
+        });
+
+        for (const task of teamState.tasks) {
+          if (task.status !== 'running' && !task.workerId) {
+            continue;
+          }
+          activeAgents.push({
+            jobId: job.id,
+            taskId: task.id,
+            role: task.role,
+            workerId: task.workerId ?? null,
+            status: task.status,
+            startedAt: task.startedAt ?? null,
+            lastHeartbeatAt: task.lastHeartbeatAt ?? null,
+            claimExpiresAt: task.claimExpiresAt ?? null,
+          });
+        }
+      } else {
+        activeJobs.push({
+          id: job.id,
+          provider: job.provider,
+          mode: job.mode,
+          status: job.status,
+          task: job.task,
+          repo: job.repo,
+          ref: job.ref,
+          startedAt: job.startedAt,
+          updatedAt: job.updatedAt,
+        });
+      }
+    }
+
+    return {
+      generatedAt: new Date().toISOString(),
+      jobs: counters,
+      activeJobs,
+      activeAgents,
+      tokens: {
+        inputTokens,
+        outputTokens,
+        totalTokens,
+        jobsWithUsage,
+        jobsWithoutUsage,
+      },
+    };
   }
 
   async applyAction(jobId: string, action: JobAction): Promise<JobRecord> {
@@ -435,10 +749,12 @@ export class JobsService {
     const options = asRecord(job.options);
     const team = asRecord(options.team);
     const state = asRecord(team.state);
+    const base = defaultTeamState(team as Record<string, unknown>);
     return {
-      ...defaultTeamState(options.team as Record<string, unknown>),
+      ...base,
       ...state,
-      tasks: Array.isArray(state.tasks) ? (state.tasks as TeamTaskState[]) : [],
+      mailbox: normalizeTeamMailbox(state.mailbox),
+      tasks: Array.isArray(state.tasks) ? (state.tasks as TeamTaskState[]) : base.tasks,
     };
   }
 
@@ -459,6 +775,7 @@ export class JobsService {
       taskSeed.length > 0
         ? ({ ...defaultTeamState(team), ...current, tasks: taskSeed } as TeamRunState)
         : defaultTeamState(team);
+    state.mailbox = normalizeTeamMailbox(current.mailbox);
     const next = updater({
       ...state,
       phase: toTeamTaskPhase(state.tasks),
@@ -484,5 +801,51 @@ export class JobsService {
 
   async addEvent(jobId: string, type: string, message: string, payload?: Record<string, unknown>) {
     await this.store.addEvent(jobId, type, message, payload);
+  }
+
+  private collectJobTokenUsage(job: JobRecord): TokenUsage | null {
+    if (job.mode === 'team') {
+      const state = this.extractJobTeamState(job);
+      let inputTokens = 0;
+      let outputTokens = 0;
+      let totalTokens = 0;
+      let hasUsage = false;
+
+      for (const task of state.tasks) {
+        const output = asRecord(task.output);
+        const parsed = output.parsed;
+        const usage = extractTokenUsage(parsed);
+        if (!usage) {
+          continue;
+        }
+        hasUsage = true;
+        inputTokens += usage.inputTokens ?? 0;
+        outputTokens += usage.outputTokens ?? 0;
+        totalTokens += usage.totalTokens ?? 0;
+      }
+
+      if (!hasUsage) {
+        return null;
+      }
+
+      return {
+        inputTokens,
+        outputTokens,
+        totalTokens,
+      };
+    }
+
+    const output = asRecord(job.output);
+    const directUsage = extractTokenUsage(output);
+    if (directUsage) {
+      return directUsage;
+    }
+
+    const parsedUsage = extractTokenUsage(output.parsed);
+    if (parsedUsage) {
+      return parsedUsage;
+    }
+
+    return null;
   }
 }

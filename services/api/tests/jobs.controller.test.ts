@@ -14,6 +14,27 @@ class RecordingService {
 
   getTeamState = async (jobId: string) => ({ jobId, status: 'queued', metrics: { total: 1, queued: 1 } });
 
+  getTeamMailbox = async (jobId: string) => [
+    {
+      id: 'm1',
+      kind: 'reassign',
+      taskId: 'team-planner',
+      message: 'retry planner',
+      to: 'planner',
+      delivered: false,
+      createdAt: '2026-02-20T00:00:00.000Z',
+    },
+    { id: 'm2', kind: 'notice', message: 'note', delivered: false, createdAt: '2026-02-20T00:01:00.000Z' },
+  ];
+
+  sendTeamMailboxMessage = async (jobId: string, message: Record<string, unknown>) => ({
+    jobId,
+    ...message,
+    id: 'generated',
+    delivered: false,
+    deliveredAt: null,
+  });
+
   applyAction = async (jobId: string, action: string) => ({ id: jobId, status: action });
   listRecentEvents = async () => [
     {
@@ -56,6 +77,13 @@ describe('JobsController', () => {
     assert.equal(state.status, 'queued');
   });
 
+  test('getTeamMailbox forwards to service result', async () => {
+    const mailbox = (await controller.getTeamMailbox('job-mailbox')) as Array<{ kind: string }>;
+    assert.equal(mailbox.length, 2);
+    assert.equal(mailbox[0].kind, 'reassign');
+    assert.equal(mailbox[1].kind, 'notice');
+  });
+
   test('action validates supported action values', async () => {
     const result = await controller.action('job-4', 'approve');
     assert.equal(result.id, 'job-4');
@@ -79,5 +107,19 @@ describe('JobsController', () => {
     const payload = event.data as { id: string; type?: string; message?: string };
     assert.equal(event.type, 'queued');
     assert.equal(payload.id, 'evt-1');
+  });
+
+  test('sendTeamMailboxMessage forwards to service with payload', async () => {
+    const response = (await controller.sendTeamMailboxMessage('job-6', {
+      kind: 'notice',
+      message: 'please note',
+      to: 'planner',
+      taskId: 'team-planner',
+    })) as { jobId: string; kind: string; to: string; message: string };
+
+    assert.equal(response.jobId, 'job-6');
+    assert.equal(response.kind, 'notice');
+    assert.equal(response.to, 'planner');
+    assert.equal(response.message, 'please note');
   });
 });
