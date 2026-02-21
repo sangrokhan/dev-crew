@@ -15,6 +15,7 @@
     "setup:cli-paths": "node ./bin/dev-crew.mjs setup-cli-paths",
     "setup:cli-paths:dry-run": "node ./bin/dev-crew.mjs setup-cli-paths --dry-run",
     "build": "npm run build -w services/api && npm run build -w services/worker",
+    "test": "npm run test -w services/api && npm run test -w services/worker",
     "dev": "npm run dev:local",
     "dev:local": "node ./scripts/dev-local.mjs",
     "dev:api": "npm run start:dev -w services/api",

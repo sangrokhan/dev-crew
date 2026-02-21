@@ -1,7 +1,26 @@
 # Codex Team 오케스트레이션 구현 문서 (Codex CLI 단독 운영 기준)
 
-작성일: 2026-02-20  
+작성일: 2026-02-21  
 버전: v0.1 (실행형 문서)
+
+## 문서 동기화 기준 체크리스트 (2026-02-21)
+
+- [x] Provider 스펙 동기화: `gemini`를 OpenAPI/실행 경로와 정렬
+- [x] 팀 상태 저장소 경로 동기화: SSOT를 `.omx/state/jobs/<job-id>/`로 고정
+- [x] OpenAPI 스키마 정합성 정리: `TeamState`/`Provider`/액션 경로를 구현과 정렬
+- [x] 구현 미완료 항목 정렬: 중복 항목을 P0~P3 우선순위로 통합
+- [x] 통합 테스트 실행: 체크리스트 반영 항목 기반 회귀 테스트 완료
+
+### 우선순위 통합 체크리스트 (P0~P3)
+
+- [x] P0: 팀 저장 경로/상태 저장소 정렬 (`.omx/state/jobs/<job-id>`) 및 상태 스키마 기준 통일
+- [x] P0: `parallelTasks` 동작 + backoff/jitter 적용
+- [x] P0: 태스크 claim lease 회수/재할당 처리
+- [x] P0: 태스크 `requiresApproval` 검출 시 `waiting_approval` 게이트 전환
+- [x] P1: 구조화 산출물 전달 파이프라인 연계 (`DEPENDENCY_OUTPUTS` 및 이전 태스크 output 주입)
+- [x] P1: 팀 non-reporting/실패 감지 후 자동 재할당 정책 강화
+- [x] P2: 운영 지표(큐/실행/대기/실패 집계) 계산 경로 반영 (`team.state.metrics`)
+- [x] P3: 통합 테스트 실행 완료 (팀 라우팅/락 회수/심박 커버)
 
 ## 1) 목적
 
@@ -132,11 +151,11 @@
 - [x] `parallelTasks`가 실제 병렬 실행으로 동작
   - `TeamTask`를 배치 단위(`startTaskBatch`)로 `running` 상태 전환 후 `Promise.all` 병렬 실행
   - 종료 후 태스크별 patch 적용으로 상태 일괄 반영
-- [ ] `parallelTasks` 동시성 상한에 대한 `backoff/jitter` 정밀 튜닝
-- [ ] Team 역할이 완료/검증한 산출물을 structured JSON으로 파싱해 다음 단계가 읽는 파이프라인 연계 없음
-- [ ] 승인 게이트를 태스크 단위로 세밀하게 분기하지 않음
-- [ ] 작업자 하트비트/Lease 기반 claim 분산은 미구현
-- [ ] team 작업 상태를 별도 정규형 테이블로 분리하지 않음(`Job.options.team.state` JSON 사용)
+- [x] `parallelTasks` 동시성 상한에 대한 backoff/jitter 적용
+- [x] Team 역할이 완료/검증한 산출물을 structured JSON으로 파싱해 다음 단계가 읽는 파이프라인 연계
+- [x] 승인 게이트를 태스크 단위로 분기
+- [x] 작업자 하트비트/Lease 기반 claim 분산 및 리커버리
+- [x] team 작업 상태를 별도 정규형 테이블로 분리하지 않음(`Job.options.team.state` JSON 사용)
 - [ ] tmux 시각화 모드에서 팀 역할별 멀티 pane 운영 미구현
 - [ ] 재시작/크래시 복구에서 락 충돌 대응이 제한적
 - [ ] 고급 관측 지표(Queue length, 실행 시간분포, 승인 대기시간) 미구현

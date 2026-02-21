@@ -139,7 +139,7 @@ components:
   schemas:
     Provider:
       type: string
-      enum: [codex, claude]
+      enum: [codex, claude, gemini]
     JobMode:
       type: string
       enum: [autopilot, team, ralph, ultrawork, pipeline]
@@ -260,6 +260,7 @@ components:
       properties:
         status:
           type: string
+          enum: [queued, running, waiting_approval, succeeded, failed, canceled]
         phase:
           type: string
         fixAttempts:
@@ -277,7 +278,98 @@ components:
         tasks:
           type: array
           items:
-            type: object
+            $ref: '#/components/schemas/TeamTask'
+        metrics:
+          type: object
+          nullable: true
+          properties:
+            total:
+              type: integer
+              minimum: 0
+            queued:
+              type: integer
+              minimum: 0
+            running:
+              type: integer
+              minimum: 0
+            blocked:
+              type: integer
+              minimum: 0
+            succeeded:
+              type: integer
+              minimum: 0
+            failed:
+              type: integer
+              minimum: 0
+            canceled:
+              type: integer
+              minimum: 0
+            terminal:
+              type: integer
+              minimum: 0
+    TeamTask:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - role
+        - status
+        - attempt
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        role:
+          type: string
+          enum: [planner, researcher, designer, developer, executor, verifier]
+        dependencies:
+          type: array
+          items:
+            type: string
+        maxAttempts:
+          type: integer
+          minimum: 1
+          maximum: 5
+        timeoutSeconds:
+          type: integer
+          minimum: 60
+          maximum: 3600
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed, blocked, canceled]
+        attempt:
+          type: integer
+          minimum: 0
+        startedAt:
+          type: string
+          nullable: true
+          format: date-time
+        finishedAt:
+          type: string
+          nullable: true
+          format: date-time
+        workerId:
+          type: string
+          nullable: true
+        claimToken:
+          type: string
+          nullable: true
+        claimExpiresAt:
+          type: string
+          nullable: true
+          format: date-time
+        lastHeartbeatAt:
+          type: string
+          nullable: true
+          format: date-time
+        error:
+          type: string
+          nullable: true
+        output:
+          type: object
+          nullable: true
     CreateJobRequest:
       type: object
       additionalProperties: false

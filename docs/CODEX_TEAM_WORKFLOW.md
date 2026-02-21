@@ -1,5 +1,24 @@
 # 팀 협업 오케스트레이션 기능 스펙
 
+## 문서 동기화 기준 체크리스트 (2026-02-21)
+
+- [x] Provider 스펙 동기화: `gemini`를 OpenAPI/실행 경로와 정렬
+- [x] 팀 상태 저장소 경로 동기화: SSOT를 `.omx/state/jobs/<job-id>/`로 고정
+- [x] OpenAPI 스키마 정합성 정리: `TeamState`/`Provider`/액션 경로를 구현과 정렬
+- [x] 구현 미완료 항목 정렬: 중복 항목을 P0~P3 우선순위로 통합
+- [x] 통합 테스트 실행: 체크리스트 반영 항목 기반 회귀 테스트 완료
+
+### 우선순위 통합 체크리스트 (P0~P3)
+
+- [x] P0: 팀 상태 경로를 SSOT로 통일 (`.omx/state/jobs/<job-id>`)
+- [x] P0: `parallelTasks` 병렬 실행 + 백오프/재시도 처리
+- [x] P0: 태스크 claim lease 회수 및 heartbeat 갱신
+- [x] P0: `requiresApproval` 감지로 승인 게이트 분기
+- [x] P1: 팀 산출물의 구조화 파이프라인 연계
+- [x] P1: dead/non-reporting worker 자동 재할당 고도화
+- [x] P2: 모니터링/메트릭 정합성 고도화
+- [x] P3: 통합 테스트 실행 완료 (팀 라우팅/락 회수/심박 커버)
+
 이 문서는 `oh-my-claudecode` 기반 팀 실행을 기능 중심으로 정리한 실무 사양이다.  
 목표는 `작업 분할 → 실행 → 검증 → 실패 복구 → 정리`를 파일 기반 상태로 일관되게 수행하는 것이다.
 
@@ -23,7 +42,7 @@
    - worker는 독립 세션에서 작업을 수행하고 상태 채널로 진척을 올린다.
 4. 상태 관리
    - 팀/Task/worker 상태를 파일로 영속화한다.
-   - 상태 항목은 `current_phase`, task 상태(`pending`, `in_progress`, `blocked`, `completed`, `failed`), 실패 횟수, heartbeat 정보를 포함한다.
+- 상태 항목은 `phase`, task 상태(`queued`, `running`, `blocked`, `succeeded`, `failed`, `canceled`), 실패 횟수, heartbeat 정보를 포함한다.
 5. 완료 판정
    - 작업이 더 이상 진행 대상이 없어야 한다.
    - 검증 게이트(테스트/빌드/정적 점검 등) 결과가 통과여야 한다.
@@ -48,15 +67,15 @@
 5. 실패면 team-fix 후 재실행
 6. 완료면 정리
 
-위 흐름에서 `pending=0`, `blocked=0`, `in_progress=0`은 기본 완료 후보 조건이며  
+위 흐름에서 `queued=0`, `blocked=0`, `running=0`은 기본 완료 후보 조건이며  
 실제 성공 전환은 verify 통과와 실패 정책 준수까지 포함한다.
 
 ## 4. 상태 판정 규칙
 
 - Task 집계 기준
-  - `total`, `pending`, `blocked`, `in_progress`, `completed`, `failed`를 항상 계산한다.
+- `total`, `queued`, `running`, `blocked`, `succeeded`, `failed`, `canceled`를 항상 계산한다.
 - 종료 조건 제안
-  - 필수: `pending=0`, `in_progress=0`, `blocked=0`
+- 필수: `queued=0`, `running=0`, `blocked=0`
   - 권장: `failed=0` (또는 사전 승인된 예외)
 - 예외:
   - 단기적으로 worker가 응답하지 않더라도 heartbeat가 살아 있으면 waiting 상태로 구분.
@@ -72,13 +91,13 @@
 
 ## 6. 체크리스트
 
-- [ ] 작업 단위가 겹치지 않게 분해되었는가?
-- [ ] `blocked_by` 의존성이 명확한가?
-- [ ] task state transition과 verify 게이트가 정의되었는가?
-- [ ] 종료 조건(`pending/blocked/in_progress`) 검증이 자동화되었는가?
-- [ ] dead/non-reporting worker 대응이 자동 재배정으로 이어지는가?
-- [ ] 종료 시 환경 정리(shutdown + 상태 정리)가 수행되었는가?
-- [ ] 실패 이력과 원인 로그가 남아 재개 가능한가?
+- [x] 작업 단위 분해와 `blocked_by` 의존성 정규화 완료
+- [x] task state transition과 verify 게이트의 기본 경로 구현
+- [x] 종료 조건 검증 자동화(terminal 상태 기반) 완료
+- [x] P1: `queued/running/blocked` 지표 기반 자동 판정 고도화
+- [x] P1: dead/non-reporting worker 대응 자동 재배정 연동
+- [x] 종료 시 상태 정리 및 로그 잔여성 보장
+- [ ] P2: 실패 이력 기반 재개 보강
 
 ## 7. 운영 원칙
 
