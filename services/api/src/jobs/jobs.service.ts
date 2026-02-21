@@ -1,7 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { QueueService } from '../queue/queue.service';
 import { CreateJobDto } from './dto/create-job.dto';
-import { JobAction, JobRecord, JobStatus, TeamRole } from './job.types';
+import { JobAction, JobRecord, JobStatus, TeamRole, TeamTaskAction } from './job.types';
 import { JobFileStore, ListJobsOptions } from './storage/job-store';
 
 type TeamTaskStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'blocked' | 'canceled';
@@ -20,6 +20,7 @@ interface TeamTaskTemplate {
 interface TeamTaskState extends TeamTaskTemplate {
   status: TeamTaskStatus;
   attempt: number;
+  requiresApproval?: boolean;
   startedAt?: string;
   finishedAt?: string;
   workerId?: string;
@@ -33,6 +34,7 @@ interface TeamTaskState extends TeamTaskTemplate {
 interface TeamRunState {
   status: TeamRunStatus;
   phase: string;
+  approvalTaskId?: string | null;
   currentTaskId?: string | null;
   fixAttempts: number;
   maxFixAttempts: number;
@@ -63,8 +65,15 @@ interface TeamTaskMetrics {
   blocked: number;
   succeeded: number;
   failed: number;
+  waitingApproval: number;
   canceled: number;
   terminal: number;
+  activeWorkers: number;
+  averageDurationMs: number;
+  maxDurationMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
 }
 
 export interface TokenUsage {
@@ -369,7 +378,58 @@ function buildTeamTaskMetrics(tasks: TeamTaskState[]): TeamTaskMetrics {
   const blocked = tasks.filter((task) => task.status === 'blocked').length;
   const succeeded = tasks.filter((task) => task.status === 'succeeded').length;
   const failed = tasks.filter((task) => task.status === 'failed').length;
+  const waitingApproval = tasks.filter((task) => Boolean(task.requiresApproval)).length;
   const canceled = tasks.filter((task) => task.status === 'canceled').length;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let totalTokens = 0;
+
+  const durationsMs = tasks.reduce((sum, task) => {
+    if (!task.startedAt || !task.finishedAt) {
+      return sum;
+    }
+
+    const start = Date.parse(task.startedAt);
+    const end = Date.parse(task.finishedAt);
+    if (Number.isNaN(start) || Number.isNaN(end) || end < start) {
+      return sum;
+    }
+
+    return sum + (end - start);
+  }, 0);
+  const completedWithDuration = tasks.filter((task) => {
+    if (!task.startedAt || !task.finishedAt) {
+      return false;
+    }
+
+    const start = Date.parse(task.startedAt);
+    const end = Date.parse(task.finishedAt);
+    return !Number.isNaN(start) && !Number.isNaN(end) && end >= start;
+  }).length;
+  const maxDuration = tasks.reduce((nextMax, task) => {
+    if (!task.startedAt || !task.finishedAt) {
+      return nextMax;
+    }
+
+    const start = Date.parse(task.startedAt);
+    const end = Date.parse(task.finishedAt);
+    if (Number.isNaN(start) || Number.isNaN(end) || end < start) {
+      return nextMax;
+    }
+
+    return Math.max(nextMax, end - start);
+  }, 0);
+  const averageDurationMs = completedWithDuration > 0 ? Math.round(durationsMs / completedWithDuration) : 0;
+  for (const task of tasks) {
+    const usage = extractTokenUsage(task.output);
+    if (!usage) {
+      continue;
+    }
+
+    inputTokens += usage.inputTokens ?? 0;
+    outputTokens += usage.outputTokens ?? 0;
+    totalTokens += usage.totalTokens ?? 0;
+  }
 
   return {
     total,
@@ -378,8 +438,15 @@ function buildTeamTaskMetrics(tasks: TeamTaskState[]): TeamTaskMetrics {
     blocked,
     succeeded,
     failed,
+    waitingApproval,
     canceled,
     terminal: succeeded + failed + canceled,
+    activeWorkers: tasks.filter((task) => task.status === 'running' && Boolean(task.workerId)).length,
+    averageDurationMs,
+    maxDurationMs: maxDuration,
+    inputTokens,
+    outputTokens,
+    totalTokens,
   };
 }
 
@@ -646,6 +713,9 @@ export class JobsService {
 
   async applyAction(jobId: string, action: JobAction): Promise<JobRecord> {
     const current = await this.getJob(jobId);
+    const jobOptions = asRecord(current.options);
+    const team = asRecord(jobOptions.team);
+    const teamState = asRecord(team.state);
 
     if (action === 'cancel') {
       if (TERMINAL_STATUSES.includes(current.status)) {
@@ -693,10 +763,26 @@ export class JobsService {
     }
 
     if (action === 'approve') {
+      const nextOptions =
+        current.mode === 'team'
+          ? ({
+              ...jobOptions,
+              team: {
+                ...team,
+                state: {
+                  ...teamState,
+                  status: 'queued',
+                  approvalTaskId: null,
+                  currentTaskId: null,
+                },
+              },
+            } as Record<string, unknown>)
+          : jobOptions;
       const updated = await this.store.updateJob(jobId, {
         approvalState: 'approved',
         status: 'queued',
         error: null,
+        options: current.mode === 'team' ? nextOptions : jobOptions,
       });
       await this.addEvent(jobId, 'approval', 'Approval granted, re-queued');
       await this.queue.enqueueJob(jobId);
@@ -711,6 +797,79 @@ export class JobsService {
     });
     await this.addEvent(jobId, 'approval', 'Approval rejected');
     await this.rewindTeamStateForApproval(jobId, current.mode === 'team' ? this.extractJobTeamState(current) : undefined);
+    return updated;
+  }
+
+  async applyTaskAction(jobId: string, taskId: string, action: TeamTaskAction): Promise<JobRecord> {
+    const current = await this.getJob(jobId);
+    if (current.mode !== 'team') {
+      throw new BadRequestException('Task actions are only supported for team jobs');
+    }
+
+    const teamState = this.extractJobTeamState(current);
+    const targetTask = teamState.tasks.find((task) => task.id === taskId);
+    if (!targetTask) {
+      throw new NotFoundException(`Task not found: ${taskId}`);
+    }
+
+    if (current.status !== 'waiting_approval' || current.approvalState !== 'required' || !targetTask.requiresApproval) {
+      throw new ConflictException('Task is not waiting for approval');
+    }
+
+    const approvalTaskId = typeof teamState.approvalTaskId === 'string' && teamState.approvalTaskId.trim().length > 0
+      ? teamState.approvalTaskId
+      : null;
+    if (approvalTaskId && approvalTaskId !== taskId) {
+      throw new ConflictException('Task is not currently awaiting approval');
+    }
+
+    await this.updateTeamTaskState(jobId, (state) => ({
+      ...state,
+      approvalTaskId: null,
+      status: action === 'approve' ? 'queued' : 'failed',
+      currentTaskId: null,
+      tasks: state.tasks.map((task) => {
+        if (task.id !== taskId) {
+          return task;
+        }
+
+        if (action === 'approve') {
+          return {
+            ...task,
+            requiresApproval: false,
+            status: task.status === 'failed' || task.status === 'canceled' ? 'queued' : ('queued' as TeamTaskStatus),
+            error: undefined,
+          };
+        }
+
+        return {
+          ...task,
+          requiresApproval: false,
+          status: 'failed' as TeamTaskStatus,
+          error: 'Task output rejected by approver',
+          finishedAt: new Date().toISOString(),
+        };
+      }),
+    }));
+
+    if (action === 'approve') {
+      const updated = await this.store.updateJob(jobId, {
+        approvalState: 'approved',
+        status: 'queued',
+        error: null,
+      });
+      await this.addEvent(jobId, 'approval', 'Task approval granted; rerun queued');
+      await this.queue.enqueueJob(jobId);
+      return updated;
+    }
+
+    const updated = await this.store.updateJob(jobId, {
+      approvalState: 'rejected',
+      status: 'failed',
+      error: 'Rejected by approver',
+      finishedAt: new Date().toISOString(),
+    });
+    await this.addEvent(jobId, 'approval', `Task approval rejected: ${taskId}`);
     return updated;
   }
 
@@ -730,6 +889,7 @@ export class JobsService {
     const updatedState = {
       ...currentState,
       status: 'waiting_approval' as TeamRunStatus,
+      approvalTaskId: null,
       tasks: rewoundTasks,
       currentTaskId: null,
     } as TeamRunState;
