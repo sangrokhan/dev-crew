@@ -18,11 +18,11 @@ import {
 import { MessageEvent } from '@nestjs/common';
 import { Observable, filter, from, interval, map, mergeMap, startWith } from 'rxjs';
 import { CreateJobDto } from './dto/create-job.dto';
-import { actions, JobAction } from './job.types';
+import { actions, teamTaskActions, JobAction, TeamTaskAction } from './job.types';
 import { JobsService } from './jobs.service';
 
 @ApiTags('jobs')
-@Controller('jobs')
+@Controller(['jobs', 'runs'])
 export class JobsController {
   constructor(private readonly jobsService: JobsService) {}
 
@@ -66,6 +66,23 @@ export class JobsController {
     @Body() message: Record<string, unknown>,
   ): Promise<unknown> {
     return this.jobsService.sendTeamMailboxMessage(jobId, message);
+  }
+
+  @Post(':jobId/team/tasks/:taskId/actions/:action')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Apply approve/reject action to a team task awaiting approval' })
+  @ApiParam({ name: 'action', enum: teamTaskActions })
+  @ApiParam({ name: 'taskId', type: String })
+  taskAction(
+    @Param('jobId') jobId: string,
+    @Param('taskId') taskId: string,
+    @Param('action') action: string,
+  ) {
+    if (!teamTaskActions.includes(action as TeamTaskAction)) {
+      throw new BadRequestException(`Unsupported task action: ${action}`);
+    }
+
+    return this.jobsService.applyTaskAction(jobId, taskId, action as TeamTaskAction);
   }
 
   @Post(':jobId/actions/:action')
