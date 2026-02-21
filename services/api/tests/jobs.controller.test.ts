@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { firstValueFrom } from 'rxjs';
 import { afterEach, beforeEach, describe, test } from 'node:test';
+import { PATH_METADATA } from '@nestjs/common/constants';
+import 'reflect-metadata';
 
 import { JobsController } from '../src/jobs/jobs.controller';
 
@@ -35,6 +37,12 @@ class RecordingService {
     deliveredAt: null,
   });
 
+  applyTaskAction = async (jobId: string, taskId: string, action: string) => ({
+    id: jobId,
+    taskId,
+    status: action,
+  });
+
   applyAction = async (jobId: string, action: string) => ({ id: jobId, status: action });
   listRecentEvents = async () => [
     {
@@ -59,6 +67,13 @@ afterEach(() => {
 });
 
 describe('JobsController', () => {
+  test('supports both jobs and runs base paths', () => {
+    const paths = Reflect.getMetadata(PATH_METADATA, JobsController);
+    assert.equal(Array.isArray(paths), true);
+    assert.equal(paths.includes('jobs'), true);
+    assert.equal(paths.includes('runs'), true);
+  });
+
   test('create calls service and returns id/status', async () => {
     const created = await controller.create({ jobId: 'c1' } as any);
     assert.equal(created.jobId, 'c1');
@@ -98,6 +113,29 @@ describe('JobsController', () => {
         assert.equal(response.response.message.includes('Unsupported action: invalid'), true);
       } else {
         assert.equal(response.response?.message, 'Unsupported action: invalid');
+      }
+    }
+  });
+
+  test('taskAction validates and forwards', async () => {
+    const result = (await controller.taskAction('job-4', 'team-planner', 'approve') as unknown) as {
+      id: string;
+      taskId: string;
+      status: string;
+    };
+    assert.equal(result.id, 'job-4');
+    assert.equal(result.taskId, 'team-planner');
+    assert.equal(result.status, 'approve');
+
+    try {
+      await controller.taskAction('job-4', 'team-planner', 'invalid' as never);
+      assert.fail('Invalid task action should reject');
+    } catch (error) {
+      const response = error as { response?: { message?: string | string[] } };
+      if (Array.isArray(response.response?.message)) {
+        assert.equal(response.response.message.includes('Unsupported task action: invalid'), true);
+      } else {
+        assert.equal(response.response?.message, 'Unsupported task action: invalid');
       }
     }
   });

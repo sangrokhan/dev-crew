@@ -27,6 +27,9 @@
   },
   "dependencies": {
   },
+  "overrides": {
+    "ajv": "8.18.0"
+  },
   "devDependencies": {
     "typescript": "^5.7.3"
   }

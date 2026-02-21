@@ -169,7 +169,8 @@ team 모드 실행 중 상태를 보기 위해서는 다음도 함께 확인합�
 curl -s http://localhost:8080/v1/jobs/{jobId}/team
 ```
 
-Team 모드 동작 범위와 현재 미완성 항목은 `docs/CODEX_TEAM_IMPLEMENTATION_DELIVERY.md`를 참고하세요.
+Team 모드 동작 범위는 `docs/CODEX_TEAM_IMPLEMENTATION_SPEC.md`(구현 기준),  
+운영 절차와 동기화 규칙은 `docs/CODEX_TEAM_WORKFLOW.md`를 참고하세요.
 
 `paused/requires approval` 상태에서 재개하려면 아래를 호출합니다.
 
@@ -231,4 +232,4 @@ infra/        # docker-compose
 기존 Python 구현은 TypeScript 전환 과정에서 분리되었으며, 현재 레포에서 제거되어 있습니다.
 신규 개발/운영 기준은 TypeScript 워크스페이스입니다.
 
-자세한 운영 가이드는 `docs/TYPESCRIPT_OPERATIONS.md`를 참고하세요.
+자세한 운영 가이드는 `docs/CODEX_TEAM_WORKFLOW.md`와 `docs/TYPESCRIPT_OPERATIONS.md`를 참고하세요.

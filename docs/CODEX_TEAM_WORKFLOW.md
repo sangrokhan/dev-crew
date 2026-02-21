@@ -1,113 +1,153 @@
-# 팀 협업 오케스트레이션 기능 스펙
-
-## 문서 동기화 기준 체크리스트 (2026-02-21)
-
-- [x] Provider 스펙 동기화: `gemini`를 OpenAPI/실행 경로와 정렬
-- [x] 팀 상태 저장소 경로 동기화: SSOT를 `.omx/state/jobs/<job-id>/`로 고정
-- [x] OpenAPI 스키마 정합성 정리: `TeamState`/`Provider`/액션 경로를 구현과 정렬
-- [x] 구현 미완료 항목 정렬: 중복 항목을 P0~P3 우선순위로 통합
-- [x] 통합 테스트 실행: 체크리스트 반영 항목 기반 회귀 테스트 완료
-
-### 우선순위 통합 체크리스트 (P0~P3)
-
-- [x] P0: 팀 상태 경로를 SSOT로 통일 (`.omx/state/jobs/<job-id>`)
-- [x] P0: `parallelTasks` 병렬 실행 + 백오프/재시도 처리
-- [x] P0: 태스크 claim lease 회수 및 heartbeat 갱신
-- [x] P0: `requiresApproval` 감지로 승인 게이트 분기
-- [x] P1: 팀 산출물의 구조화 파이프라인 연계
-- [x] P1: dead/non-reporting worker 자동 재할당 고도화
-- [x] P2: 옵션 기반 Team tmux 역할별 시각화(`options.team.tmuxVisualization`) 부분 구현
-- [x] P2: 모니터링/메트릭 정합성 고도화
-- [x] P3: 통합 테스트 실행 완료 (팀 라우팅/락 회수/심박 커버)
-
-이 문서는 `oh-my-claudecode` 기반 팀 실행을 기능 중심으로 정리한 실무 사양이다.  
-목표는 `작업 분할 → 실행 → 검증 → 실패 복구 → 정리`를 파일 기반 상태로 일관되게 수행하는 것이다.
+# 팀 오케스트레이션 실행 워크플로우
 
 ## 1. 목적
 
-- 사용자의 단일 요청을 다수 worker로 분할 처리한다.
-- 실행 완료를 수치적으로 판정 가능한 상태 조건으로 판단한다.
-- 비정상 종료나 중단 시에도 재개/복구가 가능하도록 상태를 보존한다.
-- 종료 시 잔존 자원과 상태를 정리한다.
+Team 모드의 운영 전 과정을 단일 참조점으로 정리한다.
 
-## 2. 기능 요구사항
+- 대상 범위: `services/api`, `services/worker`, 파일 기반 SSOT
+- 기준 API: `/v1/jobs/*`
+- 기준 사양: `docs/CODEX_TEAM_IMPLEMENTATION_SPEC.md`
+- 운영 가이드: `docs/TYPESCRIPT_OPERATIONS.md`
 
-1. 팀 시작
-   - 명령으로 팀 실행을 시작할 수 있어야 한다.
-   - 입력에서 worker 수, worker 타입, 작업 제목을 파싱해 팀 이름을 생성한다.
-2. 작업 분할
-   - 요청을 실행 가능한 `Task` 단위로 분해한다.
-   - 각 Task는 소유 경계(파일/디렉터리/기능)와 `blocked_by` 의존성을 포함한다.
-3. 실행
-   - Task를 worker에 배정(`assignTask`)하고, 필요 시 재배정한다.
-   - worker는 독립 세션에서 작업을 수행하고 상태 채널로 진척을 올린다.
-   - `options.team.tmuxVisualization=true`이면 역할별 tmux pane 시각화 세션을 생성해 실행 로그를 확인할 수 있다.
-4. 상태 관리
-   - 팀/Task/worker 상태를 파일로 영속화한다.
-- 상태 항목은 `phase`, task 상태(`queued`, `running`, `blocked`, `succeeded`, `failed`, `canceled`), 실패 횟수, heartbeat 정보를 포함한다.
-5. 완료 판정
-   - 작업이 더 이상 진행 대상이 없어야 한다.
-   - 검증 게이트(테스트/빌드/정적 점검 등) 결과가 통과여야 한다.
-   - 실패 정책에 따라 허용 실패가 없거나, 승인된 예외가 명시되어야 한다.
-6. 검증/수정 루프
-   - verify 단계로 결과를 확인한다.
-   - 실패 시 fix 단계로 되돌려 수정 후 재검증한다.
-   - fix 반복 횟수 상한을 두어 무한 루프를 막는다.
-7. 모니터링
-   - 주기적으로 작업/worker 상태를 집계한다.
-   - 비활성 worker, heartbeat 정체(worker non-reporting), 죽은 worker를 감지해 조치 대상 표시한다.
-8. 종료/정리
-   - 정상 종료 시 shutdown-ack를 받아 pane/세션/상태를 정리한다.
-   - 실패 종료 시에도 최종 원인과 상태를 남겨 추적 가능하게 한다.
+## 2. Dispatch(작업 분배)
 
-## 3. 실행 흐름(기능 관점)
+### 2.1 시작 절차
 
-1. plan/범위 정리
-2. task 분해 및 의존성 설정
-3. team-exec 실행
-4. team-verify로 게이트 확인
-5. 실패면 team-fix 후 재실행
-6. 완료면 정리
+1. `POST /v1/jobs` with `mode: "team"`
+2. 템플릿 또는 사용자 제공 `teamTasks` 정규화
+3. team state 초기 seed 수행
+4. runnable task 계산 규칙(`blocked`/의존성)으로 실행 루프 진입
 
-위 흐름에서 `queued=0`, `blocked=0`, `running=0`은 기본 완료 후보 조건이며  
-실제 성공 전환은 verify 통과와 실패 정책 준수까지 포함한다.
+### 2.2 역할 체계
 
-## 4. 상태 판정 규칙
+- Planner
+- Researcher
+- Designer
+- Developer
+- Executor
+- Verifier
 
-- Task 집계 기준
-- `total`, `queued`, `running`, `blocked`, `succeeded`, `failed`, `canceled`를 항상 계산한다.
-- 종료 조건 제안
-- 필수: `queued=0`, `running=0`, `blocked=0`
-  - 권장: `failed=0` (또는 사전 승인된 예외)
-- 예외:
-  - 단기적으로 worker가 응답하지 않더라도 heartbeat가 살아 있으면 waiting 상태로 구분.
-  - 고장 worker는 dead로 분류 후 재배정 후보로 이동.
+### 2.3 병렬 실행
 
-## 5. 역할과 책임
+- 한 루프에서 `parallelTasks` 상한까지만 배치 실행
+- owner/claim 임시 배정 후 실행
 
-- Planner/PRD: 요구사항 분해, 범위·의존성 정의
-- Executor: 실제 작업 수행, 결과 산출
-- Verifier: 테스트/리뷰/정적검사 실행
-- Fix 루프: 실패 항목 수정 및 재검증
-- Team 관리자: 실행/모니터링/재시작/정리 총괄
+## 3. Completion Tracking(완료 관리)
 
-## 6. 체크리스트
+### 3.1 완료 후보 조건
 
-- [x] 작업 단위 분해와 `blocked_by` 의존성 정규화 완료
-- [x] task state transition과 verify 게이트의 기본 경로 구현
-- [x] 종료 조건 검증 자동화(terminal 상태 기반) 완료
-- [x] P1: `queued/running/blocked` 지표 기반 자동 판정 고도화
-- [x] P1: dead/non-reporting worker 대응 자동 재배정 연동
-- [x] P2: Team 역할별 tmux 시각화(옵션 기반) 반영
-- [x] 종료 시 상태 정리 및 로그 잔여성 보장
-- [ ] P2: 실패 이력 기반 재개 보강
+- `queued == 0`
+- `blocked == 0`
+- `running == 0`
 
-## 7. 운영 원칙
+### 3.2 운영 완료 조건
 
-- 종료는 명령 응답이 아니라 `상태 + 검증 증거 + 정리`가 모두 충족될 때만 허용한다.
-- 상태는 파일에 보존되어야 하며, 중단 시 복구 가능한 지점에서 재개할 수 있어야 한다.
-- 실패 재시도는 상한을 넘기면 강제 실패로 전환해 의사결정을 명시한다.
+- 위 기본 조건 충족
+- verify 단계 통과
+- 정책상 허용 실패 범주 충족
 
-## 8. 하위 문서
+### 3.3 상태 갱신 규칙
 
-- 동기화 파일 형식, 이벤트, 상태 경로, 재개/복구 동작은 `docs/oh-my-codex-team-workflow-sync.md`를 따른다.
+- `failed`는 `maxFixAttempts`, `maxAttempts`로 `retry` 또는 `failed` 분기
+- dead/non-reporting worker 감지 시 task 재배정
+
+## 4. Collaboration(협의/협상)
+
+### 4.1 현재 구현 범위
+
+- mailbox 조회/발송
+  - `GET /v1/jobs/{jobId}/team/mailbox`
+  - `POST /v1/jobs/{jobId}/team/mailbox`
+- 메시지 타입
+  - `notice`, `question`, `instruction`, `reassign`
+- 자동 처리 범위
+  - 현재는 `reassign` 중심 자동화
+
+### 4.2 분배/완료 가이드
+
+- 협의 포인트는 task 상태/heartbeat/실행 완료 신호와 묶어 추적
+- 요청/완료 상태는 Team state와 이벤트가 일치해야 함
+
+## 5. 동기화/상태 규격
+
+### 5.1 SSOT
+
+- Team state: `.omx/state/jobs/<job-id>/record.json`
+- 이벤트 로그: `.omx/state/jobs/<job-id>/events.jsonl`
+- 이벤트는 append-only
+
+### 5.2 동기화 체크포인트
+
+- 상태 전환 시 즉시 저장
+- resume/restart는 마지막 state 기준으로 재동기화
+- 이벤트 및 상태 스냅샷은 감사 증적으로 보존
+
+### 5.3 완료/중단/재개 인터페이스
+
+- 완료: `waiting` 조건 해제 + verify 통과
+- 종료: run 취소 신호 처리 후 task 정리
+- 재개: `POST /v1/jobs/{jobId}/actions/resume`
+
+## 6. 안정성: Lease, Heartbeat, Reassign
+
+- heartbeart 누락/비정상 연속 시 non-reporting 전환
+- claim lease 만료 또는 작업자 비정상 시 재할당
+- 동일 task 중복 claim 방지 우선으로 상태 반영
+- 재시도는 `Team state` 기반으로 멱등 동작
+
+## 7. 승인 게이트
+
+- `requiresApproval` 감지 시 run 상태를 `waiting_approval`로 전환
+- 승인 액션
+  - `POST /v1/jobs/{jobId}/actions/approve`
+  - `POST /v1/jobs/{jobId}/actions/reject`
+  - `POST /v1/jobs/{jobId}/actions/resume`
+
+## 8. 종료/재개
+
+- `cancel`, `resume`은 action API로 제어
+- resume은 진행 중이던 task를 상태 기반으로 재큐
+
+## 9. tmux 시각화(옵션)
+
+- `options.team.tmuxVisualization=true`이면 역할별 pane 시각화와 attach 정보 발행
+- 판단 기준은 tmux가 아닌 `/v1/jobs/{jobId}/team` 상태를 우선 사용
+
+## 10. 운영 체크리스트
+
+1. `GET /v1/jobs/{jobId}/team`에서 runnable/task 상태 확인
+2. `events`에서 `team.task.started`, `team.task.completed`, `team.retry`, `team.task.approval_required` 확인
+3. 승인 대기(`waiting_approval`) 시 action 처리 확인
+4. `non-reporting`/lease 만료 시 재배정 경로 점검
+5. `resume` 후 parallelTasks, deadlock 카운트, verify 경로 점검
+
+## 11. 구현 전달용 상태(축약본)
+
+### 현재 적용 요약
+
+- Team role 템플릿 및 기본 실행 루프
+- 상태 SSOT 및 이벤트 저장
+- 승인/재개 action 처리
+- task retry/fix loop
+- tmux 시각화 옵션
+
+### 후속 과제
+
+- `/runs` 계열 정규 API 전환
+- worker 간 질의/지시 자동 협의 라우팅 확장
+- worktree 격리와 패치 병합 자동화 고도화
+- structured output 파이프라인 강화
+
+## 12. 동기화 규격 체크리스트(요약)
+
+- SSOT 경로: `.omx/state/jobs/<job-id>/record.json`
+- 이벤트: `events.jsonl` append-only
+- task 동기화: dependency + blocked release + 집계
+- heartbeat/non-reporting/reassign 반영
+- 완료/재개/중단 루틴 일관성
+
+## 13. 연계 문서
+
+- 구현 사양: `docs/CODEX_TEAM_IMPLEMENTATION_SPEC.md`
+- 운영 가이드: `docs/TYPESCRIPT_OPERATIONS.md`
+- 운영 결정: `docs/DECISIONS.md`
