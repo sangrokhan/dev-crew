@@ -16,6 +16,7 @@
 - [x] P0: `requiresApproval` 감지로 승인 게이트 분기
 - [x] P1: 팀 산출물의 구조화 파이프라인 연계
 - [x] P1: dead/non-reporting worker 자동 재할당 고도화
+- [x] P2: 옵션 기반 Team tmux 역할별 시각화(`options.team.tmuxVisualization`) 부분 구현
 - [x] P2: 모니터링/메트릭 정합성 고도화
 - [x] P3: 통합 테스트 실행 완료 (팀 라우팅/락 회수/심박 커버)
 
@@ -40,6 +41,7 @@
 3. 실행
    - Task를 worker에 배정(`assignTask`)하고, 필요 시 재배정한다.
    - worker는 독립 세션에서 작업을 수행하고 상태 채널로 진척을 올린다.
+   - `options.team.tmuxVisualization=true`이면 역할별 tmux pane 시각화 세션을 생성해 실행 로그를 확인할 수 있다.
 4. 상태 관리
    - 팀/Task/worker 상태를 파일로 영속화한다.
 - 상태 항목은 `phase`, task 상태(`queued`, `running`, `blocked`, `succeeded`, `failed`, `canceled`), 실패 횟수, heartbeat 정보를 포함한다.
@@ -96,6 +98,7 @@
 - [x] 종료 조건 검증 자동화(terminal 상태 기반) 완료
 - [x] P1: `queued/running/blocked` 지표 기반 자동 판정 고도화
 - [x] P1: dead/non-reporting worker 대응 자동 재배정 연동
+- [x] P2: Team 역할별 tmux 시각화(옵션 기반) 반영
 - [x] 종료 시 상태 정리 및 로그 잔여성 보장
 - [ ] P2: 실패 이력 기반 재개 보강
 

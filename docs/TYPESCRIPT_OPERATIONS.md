@@ -61,6 +61,7 @@ Team mode( `mode: "team"` )에서 추가로 사용하는 값:
 - `options.team.parallelTasks`
 - `options.team.maxFixAttempts`
 - `options.team.teamTasks`
+- `options.team.tmuxVisualization` (`true`면 역할별 tmux pane 시각화 세션 생성)
 
 ## tmux 동작
 - Worker는 job 실행 시 세션을 만들고 `planner/executor/verifier` pane을 실행합니다.
@@ -70,6 +71,7 @@ Team mode( `mode: "team"` )에서 추가로 사용하는 값:
 Team 모드(`mode: "team"`)는 현재 `planner/researcher/designer/developer/executor/verifier` 역할 템플릿 기반으로 의존성 라운드 실행합니다.
 - `options.team.parallelTasks`는 동시 실행 가능한 태스크 수의 상한입니다.
 - 동일 라운드에서 `parallelTasks`개 만큼 `running`으로 전환한 뒤 병렬 실행합니다.
+- `options.team.tmuxVisualization=true`이면 역할별 pane을 열고 각 역할 실행 로그를 tail로 시각화합니다.
 - 실행 상태는 `GET /v1/jobs/{jobId}/team` API로 확인합니다.
 
 ## 호스트 실행

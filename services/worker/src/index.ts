@@ -173,8 +173,22 @@ interface JobOptionsNormalized {
   maxMinutes: number;
   keepTmuxSession: boolean;
   parallelism: number;
+  teamTmuxVisualization: boolean;
   agentCommands: Partial<Record<TeamRole, string>>;
   maxFixAttempts: number;
+}
+
+interface TeamVisualizationPane {
+  role: TeamRole;
+  paneId: string;
+  logPath: string;
+}
+
+interface TeamTmuxVisualizationRuntime {
+  sessionName: string;
+  attachCommand: string;
+  panes: TeamVisualizationPane[];
+  paneByRole: Partial<Record<TeamRole, TeamVisualizationPane>>;
 }
 
 const TEAM_TASK_STATUSES: TeamTaskStatus[] = ['queued', 'running', 'succeeded', 'failed', 'blocked', 'canceled'];
@@ -841,15 +855,33 @@ function toNonNegativeInt(value: unknown, fallback: number): number {
   return parsed >= 0 ? parsed : fallback;
 }
 
+function toBoolean(value: unknown, fallback: boolean): boolean {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+      return true;
+    }
+    if (['0', 'false', 'no', 'off'].includes(normalized)) {
+      return false;
+    }
+  }
+  return fallback;
+}
+
 function normalizeJobOptions(raw: Record<string, unknown> | null): JobOptionsNormalized {
   const obj = asObject(raw);
   const team = asObject(obj.team);
   const defaultKeepTmux = (process.env.TMUX_KEEP_SESSION_ON_FINISH ?? '1') !== '0';
+  const defaultTeamTmuxVisualization = toBoolean(process.env.TEAM_TMUX_VISUALIZATION, false);
 
   const maxMinutes = toPositiveInt(obj.maxMinutes, 60);
   const keepTmuxSession = typeof obj.keepTmuxSession === 'boolean' ? obj.keepTmuxSession : defaultKeepTmux;
   const parallelism = toPositiveInt(team.parallelTasks, toPositiveInt(obj.parallelTasks, 1));
   const maxFixAttempts = toNonNegativeInt(team.maxFixAttempts, toNonNegativeInt(obj.maxFixAttempts, 0));
+  const teamTmuxVisualization = toBoolean(team.tmuxVisualization, defaultTeamTmuxVisualization);
 
   const commandObj = asObject(obj.agentCommands);
   const agentCommands: Partial<Record<TeamRole, string>> = {};
@@ -865,6 +897,7 @@ function normalizeJobOptions(raw: Record<string, unknown> | null): JobOptionsNor
     maxMinutes,
     keepTmuxSession,
     parallelism,
+    teamTmuxVisualization,
     maxFixAttempts,
     agentCommands,
   };
@@ -1794,6 +1827,7 @@ async function executeTeamTask(
   allTasks: TeamTaskState[],
   phase: string,
   workspaceDir: string,
+  visualizationPane?: TeamVisualizationPane,
 ): Promise<TeamTaskExecutionResult> {
   const commandTemplate = resolveRoleCommand(job.provider, task.role, options.agentCommands);
   let currentAttempt = task.attempt;
@@ -1803,6 +1837,10 @@ async function executeTeamTask(
     role: task.role,
     attempt: currentAttempt,
   });
+  await appendTeamVisualizationLog(
+    visualizationPane,
+    `[task=${task.id}] started role=${task.role} attempt=${currentAttempt}`,
+  );
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -1841,6 +1879,7 @@ async function executeTeamTask(
         : verifierStatus === 'fail'
           ? 'Verifier reported status=fail'
           : undefined;
+    await appendTeamVisualizationCommandOutput(visualizationPane, taskForAttempt, command, runner, validationError);
 
     if (validationError) {
       await addEvent(job.id, 'team.task.validation_failed', `${task.id} validation failed`, {
@@ -1924,6 +1963,10 @@ async function executeTeamTask(
         status: 'queued',
       });
       await sleep(delayMs);
+      await appendTeamVisualizationLog(
+        visualizationPane,
+        `[task=${task.id}] retry scheduled role=${task.role} nextAttempt=${currentAttempt + 1} delayMs=${delayMs}`,
+      );
       currentAttempt += 1;
       continue;
     }
@@ -1957,203 +2000,219 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
   await fs.mkdir(runDir, { recursive: true });
   const options = normalizeJobOptions(job.options);
   const workspaceDir = await prepareWorkspace(job, runDir);
+  const teamVisualization = await setupTeamTmuxVisualization(job, options, runDir, workspaceDir);
 
-  let state = await readTeamState(job);
-  state.status = 'running';
-  await persistTeamState(job, state);
+  try {
+    let state = await readTeamState(job);
+    state.status = 'running';
+    await persistTeamState(job, state);
 
-  let idleCycles = 0;
-  let idleBackoff = 0;
+    let idleCycles = 0;
+    let idleBackoff = 0;
 
-  while (idleCycles < 600) {
-    const latest = await jobStore.findJobById(job.id);
+    while (idleCycles < 600) {
+      const latest = await jobStore.findJobById(job.id);
 
-    if (latest?.status === 'canceled') {
-      return { state: 'canceled' };
-    }
+      if (latest?.status === 'canceled') {
+        return finalizeTeamRunResult(job.id, teamVisualization, options.keepTmuxSession, { state: 'canceled' });
+      }
 
-    if (latest?.status === 'waiting_approval') {
-      state.status = 'waiting_approval';
-      await persistTeamState(job, state);
-      return { state: 'waiting_approval' };
-    }
+      if (latest?.status === 'waiting_approval') {
+        state.status = 'waiting_approval';
+        await persistTeamState(job, state);
+        return finalizeTeamRunResult(job.id, teamVisualization, options.keepTmuxSession, { state: 'waiting_approval' });
+      }
 
-    const current = await readTeamState(job);
-    const nowMs = Date.now();
-    const staleRunning = current.tasks.filter((task) => task.status === 'running' && isClaimExpired(task, nowMs));
-    const nonReportingRunning = current.tasks.filter((task) => isTaskNonReporting(task, nowMs));
-    const normalizedClaims = normalizeRunningClaims(current);
-    const refreshedState = refreshRunningClaims(normalizedClaims);
-    state = refreshedState;
-    const mailboxResult = await applyMailboxReassign(job.id, state);
-    state = mailboxResult.state;
+      const current = await readTeamState(job);
+      const nowMs = Date.now();
+      const staleRunning = current.tasks.filter((task) => task.status === 'running' && isClaimExpired(task, nowMs));
+      const nonReportingRunning = current.tasks.filter((task) => isTaskNonReporting(task, nowMs));
+      const normalizedClaims = normalizeRunningClaims(current);
+      const refreshedState = refreshRunningClaims(normalizedClaims);
+      state = refreshedState;
+      const mailboxResult = await applyMailboxReassign(job.id, state);
+      state = mailboxResult.state;
 
-    if (JSON.stringify(normalizedClaims) !== JSON.stringify(refreshedState) || mailboxResult.hasUndeliveredMessages) {
-      const claimRecoveredTaskIds = state.tasks
-        .filter((task) => task.status === 'queued' || task.status === 'blocked')
-        .map((task) => task.id);
-      if (claimRecoveredTaskIds.length > 0) {
-        await addEvent(job.id, 'team.claim_recovered', 'Recovered or refreshed task claims for scheduling', {
-          taskIds: claimRecoveredTaskIds,
+      if (JSON.stringify(normalizedClaims) !== JSON.stringify(refreshedState) || mailboxResult.hasUndeliveredMessages) {
+        const claimRecoveredTaskIds = state.tasks
+          .filter((task) => task.status === 'queued' || task.status === 'blocked')
+          .map((task) => task.id);
+        if (claimRecoveredTaskIds.length > 0) {
+          await addEvent(job.id, 'team.claim_recovered', 'Recovered or refreshed task claims for scheduling', {
+            taskIds: claimRecoveredTaskIds,
+          });
+        }
+        await persistTeamState(job, state);
+      }
+
+      if (staleRunning.length > 0) {
+        await addEvent(job.id, 'team.task.non_reporting', 'Recovered stale running tasks based on heartbeat expiry', {
+          taskIds: staleRunning.map((task) => task.id),
+          reason: `claim lease / heartbeat stale (${TEAM_TASK_NON_REPORTING_GRACE_MS}ms grace)`,
         });
       }
-      await persistTeamState(job, state);
-    }
 
-    if (staleRunning.length > 0) {
-      await addEvent(job.id, 'team.task.non_reporting', 'Recovered stale running tasks based on heartbeat expiry', {
-        taskIds: staleRunning.map((task) => task.id),
-        reason: `claim lease / heartbeat stale (${TEAM_TASK_NON_REPORTING_GRACE_MS}ms grace)`,
-      });
-    }
-
-    if (nonReportingRunning.length > staleRunning.length) {
-      const nonReportingIds = nonReportingRunning.map((task) => task.id);
-      await addEvent(job.id, 'team.task.non_reporting', 'Recovered tasks from non-reporting heartbeat lag', {
-        taskIds: nonReportingIds,
-        reason: `heartbeat stale over ${TEAM_TASK_NON_REPORTING_GRACE_MS}ms`,
-      });
-    }
-
-    const parallelLimit = Math.max(1, state.parallelTasks ?? options.parallelism);
-    const runnable = selectRunnableTasks(state).slice(0, parallelLimit);
-    const hasRunning = state.tasks.some((task) => task.status === 'running');
-    const hasQueued = state.tasks.some((task) => task.status === 'queued');
-
-    if (runnable.length === 0 && allTasksFinished(state)) {
-      const hasFailed = state.tasks.some((task) => task.status === 'failed');
-      if (hasFailed && state.fixAttempts < state.maxFixAttempts) {
-        const recovered = buildFailureRecoveryState(state);
-        if (recovered) {
-          state = recovered;
-          await persistTeamState(job, state);
-          await addEvent(job.id, 'team.retry', `Retrying failed task path (attempt ${state.fixAttempts}/${state.maxFixAttempts})`, {
-            taskIds: state.tasks.map((task) => task.id),
-          });
-          continue;
-        }
+      if (nonReportingRunning.length > staleRunning.length) {
+        const nonReportingIds = nonReportingRunning.map((task) => task.id);
+        await addEvent(job.id, 'team.task.non_reporting', 'Recovered tasks from non-reporting heartbeat lag', {
+          taskIds: nonReportingIds,
+          reason: `heartbeat stale over ${TEAM_TASK_NON_REPORTING_GRACE_MS}ms`,
+        });
       }
 
-      state.status = state.tasks.every((task) => task.status === 'succeeded') ? 'succeeded' : 'failed';
-      await persistTeamState(job, state);
-      await addEvent(job.id, 'team.completed', `Team run ${state.status}`);
-      return {
-        state: state.status === 'succeeded' ? 'succeeded' : 'failed',
-        output: {
-          phase: state.phase,
-          status: state.status,
-          tasks: state.tasks as unknown as Record<string, unknown>,
-        },
-      };
-    }
+      const parallelLimit = Math.max(1, state.parallelTasks ?? options.parallelism);
+      const runnable = selectRunnableTasks(state).slice(0, parallelLimit);
+      const hasRunning = state.tasks.some((task) => task.status === 'running');
+      const hasQueued = state.tasks.some((task) => task.status === 'queued');
 
-    if (runnable.length === 0 && !hasRunning && !hasQueued) {
-      if (state.tasks.some((task) => task.status === 'failed')) {
+      if (runnable.length === 0 && allTasksFinished(state)) {
+        const hasFailed = state.tasks.some((task) => task.status === 'failed');
+        if (hasFailed && state.fixAttempts < state.maxFixAttempts) {
+          const recovered = buildFailureRecoveryState(state);
+          if (recovered) {
+            state = recovered;
+            await persistTeamState(job, state);
+            await addEvent(job.id, 'team.retry', `Retrying failed task path (attempt ${state.fixAttempts}/${state.maxFixAttempts})`, {
+              taskIds: state.tasks.map((task) => task.id),
+            });
+            continue;
+          }
+        }
+
+        state.status = state.tasks.every((task) => task.status === 'succeeded') ? 'succeeded' : 'failed';
+        await persistTeamState(job, state);
+        await addEvent(job.id, 'team.completed', `Team run ${state.status}`);
+        return finalizeTeamRunResult(job.id, teamVisualization, options.keepTmuxSession, {
+          state: state.status === 'succeeded' ? 'succeeded' : 'failed',
+          output: {
+            phase: state.phase,
+            status: state.status,
+            tasks: state.tasks as unknown as Record<string, unknown>,
+          },
+        });
+      }
+
+      if (runnable.length === 0 && !hasRunning && !hasQueued) {
+        if (state.tasks.some((task) => task.status === 'failed')) {
+          if (state.fixAttempts >= state.maxFixAttempts) {
+            state.status = 'failed';
+            await persistTeamState(job, state);
+            throw new Error('team run fixed attempts exhausted');
+          }
+
+          const recovered = buildFailureRecoveryState(state);
+          if (recovered) {
+            state = recovered;
+            await persistTeamState(job, state);
+            await addEvent(
+              job.id,
+              'team.retry',
+              `Retrying failed task path (attempt ${state.fixAttempts}/${state.maxFixAttempts})`,
+              {
+                taskIds: state.tasks.map((task) => task.id),
+              },
+            );
+            continue;
+          }
+        }
+
         if (state.fixAttempts >= state.maxFixAttempts) {
           state.status = 'failed';
           await persistTeamState(job, state);
-          throw new Error('team run fixed attempts exhausted');
+          throw new Error('team run blocked with no runnable tasks');
         }
 
-        const recovered = buildFailureRecoveryState(state);
-        if (recovered) {
-          state = recovered;
-          await persistTeamState(job, state);
-          await addEvent(
-            job.id,
-            'team.retry',
-            `Retrying failed task path (attempt ${state.fixAttempts}/${state.maxFixAttempts})`,
-            {
-              taskIds: state.tasks.map((task) => task.id),
-            },
-          );
-          continue;
-        }
-      }
-
-      if (state.fixAttempts >= state.maxFixAttempts) {
-        state.status = 'failed';
+        state.status = 'running';
+        state.fixAttempts += 1;
         await persistTeamState(job, state);
-        throw new Error('team run blocked with no runnable tasks');
+        await addEvent(job.id, 'team.blocked', 'No runnable task; applying fix attempt backoff');
+        await sleep(withBackoffDelay(idleBackoff));
+        idleBackoff += 1;
+        continue;
       }
 
-      state.status = 'running';
-      state.fixAttempts += 1;
+      if (runnable.length === 0) {
+        idleCycles += 1;
+        idleBackoff += 1;
+        await sleep(withBackoffDelay(idleBackoff));
+        continue;
+      }
+
+      idleCycles = 0;
+      idleBackoff = 0;
+
+      state = startTaskBatch(state, runnable);
       await persistTeamState(job, state);
-      await addEvent(job.id, 'team.blocked', 'No runnable task; applying fix attempt backoff');
-      await sleep(withBackoffDelay(idleBackoff));
-      idleBackoff += 1;
-      continue;
-    }
 
-    if (runnable.length === 0) {
-      idleCycles += 1;
-      idleBackoff += 1;
-      await sleep(withBackoffDelay(idleBackoff));
-      continue;
-    }
+      const runningBatch = runnable
+        .map((task) => state.tasks.find((entry) => entry.id === task.id && entry.status === 'running'))
+        .filter((task): task is TeamTaskState => Boolean(task));
 
-    idleCycles = 0;
-    idleBackoff = 0;
+      if (runningBatch.length === 0) {
+        continue;
+      }
 
-    state = startTaskBatch(state, runnable);
-    await persistTeamState(job, state);
+      const results = await Promise.all(
+        runningBatch.map((task) =>
+          executeTeamTask(
+            job,
+            options,
+            task,
+            state.tasks,
+            state.phase,
+            workspaceDir,
+            teamVisualization?.paneByRole[task.role],
+          ),
+        ),
+      );
 
-    const runningBatch = runnable
-      .map((task) => state.tasks.find((entry) => entry.id === task.id && entry.status === 'running'))
-      .filter((task): task is TeamTaskState => Boolean(task));
+      for (const result of results) {
+        state = applyTaskPatch(state, result.taskId, result.patch);
+      }
 
-    if (runningBatch.length === 0) {
-      continue;
-    }
+      state.phase = toTeamTaskPhase(state.tasks);
 
-    const results = await Promise.all(
-      runningBatch.map((task) => executeTeamTask(job, options, task, state.tasks, state.phase, workspaceDir)),
-    );
+      const requiresApproval = results.some((result) => result.requiresApproval);
+      if (requiresApproval) {
+        state.status = 'waiting_approval';
+        const approvalTask = results.find((result) => result.requiresApproval);
+        const approvalTaskId = approvalTask?.taskId ?? 'unknown';
+        await persistTeamState(job, state);
+        await jobStore.updateJob(job.id, {
+          status: 'waiting_approval',
+          approvalState: 'required',
+          error: `Team task requires approval: ${approvalTaskId}`,
+        });
+        await addEvent(job.id, 'team.waiting_approval', `Team task requires approval: ${approvalTaskId}`, {
+          taskId: approvalTaskId,
+        });
+        return finalizeTeamRunResult(job.id, teamVisualization, options.keepTmuxSession, {
+          state: 'waiting_approval',
+          output: {
+            phase: state.phase,
+            status: state.status,
+            tasks: state.tasks as unknown as Record<string, unknown>,
+          },
+        });
+      }
 
-    for (const result of results) {
-      state = applyTaskPatch(state, result.taskId, result.patch);
-    }
-
-    state.phase = toTeamTaskPhase(state.tasks);
-
-    const requiresApproval = results.some((result) => result.requiresApproval);
-    if (requiresApproval) {
-      state.status = 'waiting_approval';
-      const approvalTask = results.find((result) => result.requiresApproval);
-      const approvalTaskId = approvalTask?.taskId ?? 'unknown';
       await persistTeamState(job, state);
-      await jobStore.updateJob(job.id, {
-        status: 'waiting_approval',
-        approvalState: 'required',
-        error: `Team task requires approval: ${approvalTaskId}`,
-      });
-      await addEvent(job.id, 'team.waiting_approval', `Team task requires approval: ${approvalTaskId}`, {
-        taskId: approvalTaskId,
-      });
-      return {
-        state: 'waiting_approval',
-        output: {
-          phase: state.phase,
-          status: state.status,
-          tasks: state.tasks as unknown as Record<string, unknown>,
-        },
-      };
     }
 
+    state.status = 'failed';
     await persistTeamState(job, state);
-  }
-
-  state.status = 'failed';
-  await persistTeamState(job, state);
-  return {
-    state: 'failed',
+    return finalizeTeamRunResult(job.id, teamVisualization, options.keepTmuxSession, {
+      state: 'failed',
       output: {
         reason: 'Team run loop timed out while waiting for task progress',
         state: state as unknown as Record<string, unknown>,
       },
-    };
+    });
+  } catch (error) {
+    await finalizeTeamTmuxVisualization(job.id, teamVisualization, options.keepTmuxSession, 'error');
+    throw error;
   }
+}
 
 
 function resolveRoleCommand(
@@ -2267,6 +2326,202 @@ function makePaneLayout(sessionName: string, workspaceDir: string): PaneRuntime[
       offset: 0,
     };
   });
+}
+
+function buildTeamVisualizationSessionName(jobId: string): string {
+  return `${buildSessionName(jobId)}-team`;
+}
+
+function makeTeamVisualizationLayout(sessionName: string, workspaceDir: string): TeamVisualizationPane[] {
+  runTmux(['new-session', '-d', '-s', sessionName, '-n', 'team', '-c', workspaceDir]);
+  runTmux(['set-option', '-t', sessionName, 'remain-on-exit', 'on']);
+
+  for (let idx = 1; idx < TEAM_ROLES.length; idx += 1) {
+    runTmux(['split-window', '-t', `${sessionName}:0`, '-c', workspaceDir]);
+    runTmux(['select-layout', '-t', `${sessionName}:0`, 'tiled']);
+  }
+
+  const paneIdResult = runTmux(['list-panes', '-t', `${sessionName}:0`, '-F', '#{pane_index}|#{pane_id}']);
+  const paneRows = paneIdResult.stdout
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((row) => {
+      const [indexRaw, paneId] = row.split('|');
+      return {
+        index: Number.parseInt(indexRaw, 10),
+        paneId,
+      };
+    })
+    .sort((a, b) => a.index - b.index);
+
+  if (paneRows.length < TEAM_ROLES.length) {
+    throw new Error(`failed to allocate ${TEAM_ROLES.length} team panes, got ${paneRows.length}`);
+  }
+
+  return TEAM_ROLES.map((role, idx) => {
+    const paneId = paneRows[idx].paneId;
+    runTmux(['select-pane', '-t', paneId, '-T', `team:${role}`], true);
+    return {
+      role,
+      paneId,
+      logPath: '',
+    };
+  });
+}
+
+function trimLogPayload(value: string, maxChars: number): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  const omitted = value.length - maxChars;
+  return `${value.slice(0, maxChars)}\n... (${omitted} chars omitted)`;
+}
+
+async function appendTeamVisualizationLog(pane: TeamVisualizationPane | undefined, message: string) {
+  if (!pane) {
+    return;
+  }
+
+  const timestamp = new Date().toISOString();
+  const lines = message
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0)
+    .map((line) => `[${timestamp}] ${line}`)
+    .join('\n');
+
+  if (!lines) {
+    return;
+  }
+
+  await fs.appendFile(pane.logPath, `${lines}\n`, 'utf8').catch(() => undefined);
+}
+
+async function appendTeamVisualizationCommandOutput(
+  pane: TeamVisualizationPane | undefined,
+  task: TeamTaskState,
+  command: string,
+  runner: CodexRunOutput,
+  validationError?: string,
+) {
+  if (!pane) {
+    return;
+  }
+
+  const blocks: string[] = [
+    `[task=${task.id}] attempt=${task.attempt} exit=${runner.status}`,
+    `command:\n${trimLogPayload(command, 4000)}`,
+  ];
+
+  if (validationError) {
+    blocks.push(`validation_error: ${validationError}`);
+  }
+
+  const stdout = runner.stdout.trim();
+  if (stdout) {
+    blocks.push(`stdout:\n${trimLogPayload(stdout, 8000)}`);
+  }
+
+  const stderr = runner.stderr.trim();
+  if (stderr) {
+    blocks.push(`stderr:\n${trimLogPayload(stderr, 6000)}`);
+  }
+
+  await appendTeamVisualizationLog(pane, blocks.join('\n'));
+}
+
+async function setupTeamTmuxVisualization(
+  job: JobRecord,
+  options: JobOptionsNormalized,
+  runDir: string,
+  workspaceDir: string,
+): Promise<TeamTmuxVisualizationRuntime | null> {
+  if (!options.teamTmuxVisualization) {
+    return null;
+  }
+
+  ensureBinary('tmux', ['-V']);
+  const sessionName = buildTeamVisualizationSessionName(job.id);
+
+  if (hasTmuxSession(sessionName)) {
+    killTmuxSession(sessionName);
+  }
+
+  try {
+    const panes = makeTeamVisualizationLayout(sessionName, workspaceDir);
+    for (const pane of panes) {
+      pane.logPath = path.join(runDir, `team-${pane.role}.pane.log`);
+      await fs.writeFile(pane.logPath, '', 'utf8');
+      const tailCommand = `printf '[${pane.role}] waiting for task output\\n'; tail -n +1 -F ${shellQuote(pane.logPath)}`;
+      runTmux(['send-keys', '-t', pane.paneId, 'bash', '-lc', tailCommand, 'C-m']);
+    }
+
+    const paneByRole: Partial<Record<TeamRole, TeamVisualizationPane>> = {};
+    for (const pane of panes) {
+      paneByRole[pane.role] = pane;
+    }
+
+    const attachCommand = `tmux attach -t ${sessionName}`;
+    await addEvent(job.id, 'tmux_session_started', `team tmux visualization session started: ${sessionName}`, {
+      sessionName,
+      attachCommand,
+      runDir,
+      workspaceDir,
+      mode: 'team',
+      visualization: true,
+      panes: panes.map((pane) => ({ role: pane.role, paneId: pane.paneId, logPath: pane.logPath })),
+    });
+
+    return {
+      sessionName,
+      attachCommand,
+      panes,
+      paneByRole,
+    };
+  } catch (error) {
+    if (hasTmuxSession(sessionName)) {
+      killTmuxSession(sessionName);
+    }
+    throw error;
+  }
+}
+
+async function finalizeTeamTmuxVisualization(
+  jobId: string,
+  visualization: TeamTmuxVisualizationRuntime | null,
+  keepSession: boolean,
+  reason: string,
+) {
+  if (!visualization) {
+    return;
+  }
+
+  if (!keepSession) {
+    killTmuxSession(visualization.sessionName);
+  }
+
+  await addEvent(
+    jobId,
+    keepSession ? 'tmux_session_retained' : 'tmux_session_closed',
+    `${keepSession ? 'retained' : 'closed'} team tmux visualization session: ${visualization.sessionName}`,
+    {
+      sessionName: visualization.sessionName,
+      attachCommand: visualization.attachCommand,
+      reason,
+      keepSession,
+    },
+  ).catch(() => undefined);
+}
+
+async function finalizeTeamRunResult(
+  jobId: string,
+  visualization: TeamTmuxVisualizationRuntime | null,
+  keepTmuxSession: boolean,
+  result: RunResult,
+): Promise<RunResult> {
+  await finalizeTeamTmuxVisualization(jobId, visualization, keepTmuxSession, result.state);
+  return result;
 }
 
 async function pipePaneLogs(jobId: string, panes: PaneRuntime[]) {

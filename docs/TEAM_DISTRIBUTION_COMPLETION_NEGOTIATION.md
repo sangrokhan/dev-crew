@@ -19,6 +19,7 @@
 - [x] P0: 승인 게이트(`requiresApproval`)를 작업 단위로 반영
 - [ ] P1: mailbox 기반 협의 경로 연동(재배정/질의/지시) (부분 구현: 재배정 처리만 실행, 질의/지시는 저장/조회 수준)
 - [x] P1: 역할별 출력 파이프라인 연결 (`DEPENDENCY_OUTPUTS` 전달)
+- [x] P2: 옵션 기반 Team tmux 역할별 시각화(`options.team.tmuxVisualization`) 부분 구현
 - [x] P2: 운영 이벤트의 가시성(지표/근거 아티팩트) 강화 (`team.task.*`, `team.task.non_reporting` 등)
 - [x] P3: 통합 테스트 실행 (최종)
 
@@ -42,6 +43,7 @@
   - `dependencies`로 선행조건 지정
 - 실행 엔진:
   - `services/worker/src/index.ts`의 Team loop가 runnable(실행 가능) task를 선별해 실행
+  - `options.team.tmuxVisualization=true`일 때 역할별 tmux pane 시각화 세션을 생성해 실행 로그를 tail로 노출
   - 현재는 JSON 상태 기반이므로 “실제 다중 worker claim”은 추상적으로 운영
 
 ## 2. 완료 관리(Completion Tracking)
@@ -74,6 +76,7 @@
 `dev-crew` 기준으로는 이 중 일부만 구현되어 있고, 협의 체계는 아직 부분적이다.
 
 - [x] 구현된 것: 상태 전환, 이벤트 기록, 승인 API, 재개/취소 액션
+- [x] 구현된 것: Team 역할별 tmux 시각화 세션(옵션 기반)
 - [x] 미구현/부분 구현: 분산 worker heartbeat/claim lease *(기본 복구 흐름은 반영, 다중 worker 고도화는 미완)*
 - [ ] 미구현/부분 구현: 작업자 메일박스 기반 상호협상 *(재배정 명령 처리는 반영, 질의/지시 자동 처리 루프는 미구현)*
 - [x] 미구현/부분 구현: 역할별 세분화된 승인 게이트 *(태스크 승인 요청 감지 반영)*

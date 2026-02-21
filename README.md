@@ -72,7 +72,10 @@ curl -s -X POST http://localhost:8080/v1/jobs \
     "task": "요청사항을 팀 모드로 분해해 실행해줘",
     "options": {
       "keepTmuxSession": true,
-      "maxMinutes": 60
+      "maxMinutes": 60,
+      "team": {
+        "tmuxVisualization": true
+      }
     }
   }'
 ```
@@ -85,7 +88,7 @@ curl -s http://localhost:8080/v1/jobs/{jobId}/team/mailbox
 curl -s http://localhost:8080/v1/jobs/{jobId}/events
 ```
 
-3. tmux 상태 확인(필요 시 attach)
+3. tmux 상태 확인( `options.team.tmuxVisualization=true` 인 경우)
 ```bash
 curl -s http://localhost:8080/v1/jobs/{jobId}/events | rg -n "tmux_session_started|attachCommand"
 ```
@@ -149,7 +152,10 @@ curl -s -X POST http://localhost:8080/v1/jobs \
     "task": "plan 결과 기준으로 tmux 병렬 실행 후 결과를 동기화해줘",
     "options": {
       "maxMinutes": 30,
-      "keepTmuxSession": true
+      "keepTmuxSession": true,
+      "team": {
+        "tmuxVisualization": true
+      }
     }
   }'
 ```
