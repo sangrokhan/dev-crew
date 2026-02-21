@@ -36,6 +36,17 @@ interface TeamRunState {
   tasks: TeamTaskState[];
 }
 
+interface TeamTaskMetrics {
+  total: number;
+  queued: number;
+  running: number;
+  blocked: number;
+  succeeded: number;
+  failed: number;
+  canceled: number;
+  terminal: number;
+}
+
 const TERMINAL_STATUSES: JobStatus[] = ['succeeded', 'failed', 'canceled'];
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -181,6 +192,27 @@ function normalizeTaskTemplates(templates?: Array<Record<string, unknown>>): Tea
   ];
 }
 
+function buildTeamTaskMetrics(tasks: TeamTaskState[]): TeamTaskMetrics {
+  const total = tasks.length;
+  const queued = tasks.filter((task) => task.status === 'queued').length;
+  const running = tasks.filter((task) => task.status === 'running').length;
+  const blocked = tasks.filter((task) => task.status === 'blocked').length;
+  const succeeded = tasks.filter((task) => task.status === 'succeeded').length;
+  const failed = tasks.filter((task) => task.status === 'failed').length;
+  const canceled = tasks.filter((task) => task.status === 'canceled').length;
+
+  return {
+    total,
+    queued,
+    running,
+    blocked,
+    succeeded,
+    failed,
+    canceled,
+    terminal: succeeded + failed + canceled,
+  };
+}
+
 function defaultTeamState(rawState?: Record<string, unknown>): TeamRunState {
   const state = asRecord(rawState);
   const maxFixAttempts = typeof state.maxFixAttempts === 'number' && state.maxFixAttempts >= 0 ? Math.floor(state.maxFixAttempts) : 2;
@@ -279,10 +311,18 @@ export class JobsService {
     const team = asRecord(options.team);
     const rawState = asRecord(team.state);
     if (!rawState.status || !Array.isArray(rawState.tasks)) {
-      return defaultTeamState(team) as unknown as Record<string, unknown>;
+      const defaultState = defaultTeamState(team) as unknown as Record<string, unknown> & { tasks?: TeamTaskState[] };
+      return {
+        ...defaultState,
+        metrics: buildTeamTaskMetrics(defaultState.tasks as TeamTaskState[]),
+      } as Record<string, unknown>;
     }
 
-    return rawState as Record<string, unknown>;
+    const tasks = Array.isArray(rawState.tasks) ? (rawState.tasks as TeamTaskState[]) : [];
+    return {
+      ...(rawState as Record<string, unknown>),
+      metrics: buildTeamTaskMetrics(tasks),
+    };
   }
 
   async listRecentEvents(jobId: string, take = 100) {

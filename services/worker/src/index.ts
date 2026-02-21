@@ -12,6 +12,13 @@ const concurrency = Number(process.env.WORKER_CONCURRENCY ?? 2);
 const workRoot = process.env.WORK_ROOT ?? '/tmp/omx-web-runs';
 const fileQueueEnabled = !process.env.REDIS_URL;
 const fileQueueStaleMs = Number(process.env.WORK_QUEUE_STALE_CLAIM_MS ?? 15 * 60 * 1000);
+const TEAM_TASK_CLAIM_TTL_MS = Number(process.env.TEAM_TASK_CLAIM_TTL_MS ?? 60_000);
+const TEAM_TASK_CLAIM_LEASE_SLACK_MS = Number(process.env.TEAM_TASK_CLAIM_LEASE_SLACK_MS ?? 15_000);
+const TEAM_TASK_HEARTBEAT_MS = Number(process.env.TEAM_TASK_HEARTBEAT_MS ?? 10_000);
+const TEAM_TASK_NON_REPORTING_GRACE_MS = clampPositiveInt(
+  Number(process.env.TEAM_TASK_NON_REPORTING_GRACE_MS ?? 30_000),
+  30_000,
+);
 let shutdownRequested = false;
 
 const redisConnection = (() => {
@@ -32,6 +39,9 @@ type Role = 'planner' | 'executor' | 'verifier';
 type TeamRole = StoredTeamRole;
 const TMUX_ROLES: Role[] = ['planner', 'executor', 'verifier'];
 const TEAM_ROLES: TeamRole[] = ['planner', 'researcher', 'designer', 'developer', 'executor', 'verifier'];
+const TEAM_IDLE_BACKOFF_BASE_MS = Number(process.env.TEAM_IDLE_BACKOFF_BASE_MS ?? 800);
+const TEAM_IDLE_BACKOFF_MAX_MS = Number(process.env.TEAM_IDLE_BACKOFF_MAX_MS ?? 8_000);
+const TEAM_WORKER_ID = `worker-${process.pid}-${Math.random().toString(16).slice(2, 10)}`;
 const SHELL_COMMAND_PREFIXES = new Set([
   'bash',
   'echo',
@@ -70,6 +80,10 @@ interface TeamTaskState extends TeamTaskTemplate {
   attempt: number;
   startedAt?: string;
   finishedAt?: string;
+  workerId?: string;
+  claimToken?: string;
+  claimExpiresAt?: string;
+  lastHeartbeatAt?: string;
   error?: string;
   output?: Record<string, unknown> | undefined;
 }
@@ -134,7 +148,7 @@ function normalizeTaskStatus(raw: unknown): TeamTaskStatus {
 }
 
 interface RunResult {
-  state: 'succeeded' | 'canceled' | 'failed';
+  state: 'succeeded' | 'canceled' | 'failed' | 'waiting_approval';
   output?: Record<string, unknown>;
 }
 
@@ -150,6 +164,7 @@ interface TemplateContext {
   phase?: string;
   attempt?: number;
   workdir: string;
+  dependencyOutputs?: string;
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -159,6 +174,257 @@ function asObject(value: unknown): Record<string, unknown> {
     return {};
   }
   return value as Record<string, unknown>;
+}
+
+function toISOStringNow(): string {
+  return new Date().toISOString();
+}
+
+function parseIsoMs(value: unknown): number | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function randomTaskToken(prefix: string): string {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function clampPositiveInt(value: unknown, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback;
+  }
+
+  return Math.max(1, Math.floor(value));
+}
+
+function isClaimExpired(task: TeamTaskState, nowMs: number): boolean {
+  if (task.status !== 'running') {
+    return false;
+  }
+
+  const expiresAtMs = parseIsoMs(task.claimExpiresAt);
+  const heartbeatMs = parseIsoMs(task.lastHeartbeatAt);
+  const heartbeatGraceMs = Math.max(TEAM_TASK_NON_REPORTING_GRACE_MS, TEAM_TASK_HEARTBEAT_MS * 3);
+
+  if (expiresAtMs === null || heartbeatMs === null) {
+    return true;
+  }
+
+  return expiresAtMs <= nowMs || nowMs - heartbeatMs > heartbeatGraceMs;
+}
+
+function isTaskNonReporting(task: TeamTaskState, nowMs: number): boolean {
+  if (task.status !== 'running') {
+    return false;
+  }
+
+  const heartbeatMs = parseIsoMs(task.lastHeartbeatAt);
+  if (heartbeatMs === null) {
+    return true;
+  }
+
+  return nowMs - heartbeatMs > Math.max(TEAM_TASK_NON_REPORTING_GRACE_MS, TEAM_TASK_HEARTBEAT_MS * 3);
+}
+
+function toIsoTimeOrUndefined(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) {
+    return value;
+  }
+
+  return undefined;
+}
+
+function summarizeValueForTemplate(value: unknown): string {
+  if (value === undefined || value === null) {
+    return '';
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function parseBooleanish(value: unknown): boolean | null {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'number') {
+    if (value === 0 || value === 1) {
+      return value === 1;
+    }
+    return null;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'y'].includes(normalized)) {
+      return true;
+    }
+    if (['0', 'false', 'no', 'n'].includes(normalized)) {
+      return false;
+    }
+  }
+
+  return null;
+}
+
+function detectApprovalRequired(value: unknown): boolean {
+  const parsed = asObject(value);
+  const direct = parseBooleanish(parsed.requiresApproval) ?? parseBooleanish(parsed.requires_approval) ?? parseBooleanish(parsed.requireApproval) ??
+    parseBooleanish(parsed.require_approval);
+
+  if (direct !== null) {
+    return direct;
+  }
+
+  const approval = asObject(parsed.approval);
+  const nested = parseBooleanish(approval.required) ?? parseBooleanish(approval.isRequired) ?? parseBooleanish(approval.requiredApproval);
+
+  if (nested !== null) {
+    return nested;
+  }
+
+  return false;
+}
+
+function withBackoffDelay(attempt: number): number {
+  const safeBase = clampPositiveInt(TEAM_IDLE_BACKOFF_BASE_MS, 800);
+  const safeMax = clampPositiveInt(TEAM_IDLE_BACKOFF_MAX_MS, 8_000);
+  const capped = Math.min(safeMax, safeBase * 2 ** attempt);
+  const jitter = 0.75 + (Math.random() * 0.5);
+  const jittered = Math.floor(capped * jitter);
+  const floor = Math.min(200, capped);
+  const upper = Math.max(0, capped - floor);
+  const floorWithJitter = floor + Math.floor(upper * Math.random());
+
+  return Math.max(floor, jittered + floorWithJitter);
+}
+
+function heartbeatLeaseExpiresAt(): string {
+  const leaseMs = Math.max(15_000, TEAM_TASK_CLAIM_TTL_MS + TEAM_TASK_CLAIM_LEASE_SLACK_MS);
+  return new Date(Date.now() + leaseMs).toISOString();
+}
+
+function normalizeRunningClaims(state: TeamRunState): TeamRunState {
+  const nowMs = Date.now();
+  let hadReclaim = false;
+
+  const recovered = state.tasks.map((task) => {
+    if (!isClaimExpired(task, nowMs)) {
+      return task;
+    }
+
+    hadReclaim = true;
+    const initial = {
+      ...task,
+      workerId: undefined,
+      claimToken: undefined,
+      claimExpiresAt: undefined,
+      lastHeartbeatAt: undefined,
+      error: task.error
+        ? `${task.error}\nTask reclaim reason: ${
+          isTaskNonReporting(task, nowMs) ? 'non-reporting worker detected' : 'claim lease expired'
+        }; task reclaimed for rescheduling`
+        : `Task reclaim reason: ${
+          isTaskNonReporting(task, nowMs) ? 'non-reporting worker detected' : 'claim lease expired'
+        }; task reclaimed for rescheduling`,
+    };
+
+    return {
+      ...initial,
+      status: initial.dependencies?.length ? ('blocked' as TeamTaskStatus) : ('queued' as TeamTaskStatus),
+    };
+  });
+
+  const unlocked = recovered.map((task) => {
+    if (task.status !== 'blocked') {
+      return task;
+    }
+
+    return {
+      ...task,
+      status: isTaskReady(task, recovered) ? ('queued' as TeamTaskStatus) : 'blocked',
+    };
+  });
+
+  if (!hadReclaim) {
+    return state;
+  }
+
+  return {
+    ...state,
+    tasks: unlocked,
+  };
+}
+
+function refreshRunningClaims(state: TeamRunState): TeamRunState {
+  const nowMs = Date.now();
+  const heartbeatAt = new Date(nowMs).toISOString();
+  const heartbeatIntervalMs = Math.max(1_000, TEAM_TASK_HEARTBEAT_MS);
+  const refreshed = state.tasks.map((task) => {
+    if (task.status !== 'running') {
+      return task;
+    }
+
+    const isClaimFresh = parseIsoMs(task.claimExpiresAt) !== null && parseIsoMs(task.claimExpiresAt)! > nowMs;
+    const heartbeatDue = parseIsoMs(task.lastHeartbeatAt) === null || nowMs - parseIsoMs(task.lastHeartbeatAt)! >= heartbeatIntervalMs;
+
+    if (isClaimFresh && !heartbeatDue) {
+      return task;
+    }
+
+    return {
+      ...task,
+      workerId: TEAM_WORKER_ID,
+      claimToken: task.claimToken ?? randomTaskToken(`task-${task.id}`),
+      lastHeartbeatAt: heartbeatAt,
+      claimExpiresAt: heartbeatLeaseExpiresAt(),
+    };
+  });
+
+  return {
+    ...state,
+    tasks: refreshed,
+  };
+}
+
+function buildNormalizedTaskOutput(task: TeamTaskState, runner: CodexRunOutput) {
+  const parsed = asObject(runner.parsed);
+  const output: Record<string, unknown> = {
+    status: runner.status === 0 ? 'ok' : 'error',
+    exitCode: runner.status,
+    stdout: runner.stdout,
+    stderr: runner.stderr,
+    parsed,
+    task: task.id,
+    role: task.role,
+    attempt: task.attempt,
+  };
+
+  return {
+    output,
+    requiresApproval: detectApprovalRequired(parsed),
+  };
+}
+
+function lockTaskForExecution(task: TeamTaskState): Partial<TeamTaskState> {
+  return {
+    status: 'running',
+    attempt: task.attempt + 1,
+    startedAt: toISOStringNow(),
+    workerId: TEAM_WORKER_ID,
+    claimToken: randomTaskToken(`task-${task.id}`),
+    claimExpiresAt: heartbeatLeaseExpiresAt(),
+    lastHeartbeatAt: toISOStringNow(),
+    error: undefined,
+    output: undefined,
+  };
 }
 
 function resolveStateRoot(): string {
@@ -312,6 +578,7 @@ function applyTemplate(template: string, context: TemplateContext): string {
     PHASE: context.phase ?? '',
     ATTEMPT: String(context.attempt ?? 1),
     WORKDIR: context.workdir,
+    DEPENDENCY_OUTPUTS: context.dependencyOutputs ?? '',
   };
 
   return template
@@ -836,6 +1103,21 @@ async function readTeamState(job: JobRecord): Promise<TeamRunState> {
   };
 }
 
+function collectDependencyOutputs(task: TeamTaskState, tasks: TeamTaskState[]): Record<string, unknown> {
+  const dependencyOutputs: Record<string, unknown> = {};
+  const byId = new Map(tasks.map((item) => [item.id, item]));
+
+  for (const dependencyId of task.dependencies ?? []) {
+    const dependency = byId.get(dependencyId);
+    if (!dependency || !dependency.output) {
+      continue;
+    }
+    dependencyOutputs[dependencyId] = dependency.output;
+  }
+
+  return dependencyOutputs;
+}
+
 function normalizeTaskForRead(task: TeamTaskState, tasks: TeamTaskState[]): TeamTaskStatus {
   const status = normalizeTaskStatus(task.status);
   if (status === 'running') {
@@ -1042,25 +1324,21 @@ function startTaskBatch(state: TeamRunState, tasks: TeamTaskState[]): TeamRunSta
       return nextState;
     }
 
-    return applyTaskPatch(nextState, task.id, {
-      status: 'running',
-      attempt: current.attempt + 1,
-      startedAt: new Date().toISOString(),
-      error: undefined,
-      output: undefined,
-    });
+    return applyTaskPatch(nextState, task.id, lockTaskForExecution(current));
   }, state);
 }
 
 interface TeamTaskExecutionResult {
   taskId: string;
   patch: Partial<TeamTaskState>;
+  requiresApproval?: boolean;
 }
 
 async function executeTeamTask(
   job: JobRecord,
   options: JobOptionsNormalized,
   task: TeamTaskState,
+  allTasks: TeamTaskState[],
   phase: string,
   workspaceDir: string,
 ): Promise<TeamTaskExecutionResult> {
@@ -1077,6 +1355,7 @@ async function executeTeamTask(
     phase,
     attempt: task.attempt,
     workdir: workspaceDir,
+    dependencyOutputs: summarizeValueForTemplate(collectDependencyOutputs(task, allTasks)),
   });
 
   await addEvent(job.id, 'team.task.started', `Role=${task.role} task=${task.id} attempt=${task.attempt}`, {
@@ -1091,12 +1370,32 @@ async function executeTeamTask(
     workspaceDir,
     Math.max(30_000, (task.timeoutSeconds ?? 1200) * 1000),
   );
+  const normalized = buildNormalizedTaskOutput(task, runner);
 
-  const output: Record<string, unknown> = {
-    status: runner.status === 0 ? 'ok' : 'error',
-    stdout: runner.stdout,
-    parsed: runner.parsed ?? {},
-  };
+  if (normalized.requiresApproval) {
+    await addEvent(job.id, 'team.task.approval_required', `${task.id} requested approval`, {
+      taskId: task.id,
+      role: task.role,
+      attempt: task.attempt,
+      output: normalized.output,
+    });
+
+    return {
+      taskId: task.id,
+      requiresApproval: true,
+      patch: {
+        status: 'queued',
+        attempt: task.attempt,
+        error: 'Task output requested approval before continuing.',
+        output: normalized.output,
+        finishedAt: new Date().toISOString(),
+        workerId: undefined,
+        claimToken: undefined,
+        claimExpiresAt: undefined,
+        lastHeartbeatAt: undefined,
+      },
+    };
+  }
 
   if (runner.status !== 0 && task.attempt < (task.maxAttempts ?? 1)) {
     await addEvent(job.id, 'team.task.retry', `${task.id} failed; scheduling retry`, {
@@ -1117,8 +1416,12 @@ async function executeTeamTask(
         status: 'queued',
         attempt: task.attempt,
         error: `${runner.stderr || runner.stdout}`.slice(0, 4000),
-        output,
+        output: normalized.output,
         finishedAt: new Date().toISOString(),
+        workerId: undefined,
+        claimToken: undefined,
+        claimExpiresAt: undefined,
+        lastHeartbeatAt: undefined,
       },
     };
   }
@@ -1136,8 +1439,12 @@ async function executeTeamTask(
         status: 'failed',
         attempt: task.attempt,
         error: `${runner.stderr || runner.stdout}`.slice(0, 4000),
-        output,
+        output: normalized.output,
         finishedAt: new Date().toISOString(),
+        workerId: undefined,
+        claimToken: undefined,
+        claimExpiresAt: undefined,
+        lastHeartbeatAt: undefined,
       },
     };
   }
@@ -1154,8 +1461,12 @@ async function executeTeamTask(
     patch: {
       status: 'succeeded',
       attempt: task.attempt,
-      output,
+      output: normalized.output,
       finishedAt: new Date().toISOString(),
+      workerId: undefined,
+      claimToken: undefined,
+      claimExpiresAt: undefined,
+      lastHeartbeatAt: undefined,
     },
   };
 }
@@ -1172,6 +1483,7 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
   await persistTeamState(job, state);
 
   let idleCycles = 0;
+  let idleBackoff = 0;
 
   while (idleCycles < 600) {
     const latest = await jobStore.findJobById(job.id);
@@ -1181,11 +1493,45 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
     }
 
     if (latest?.status === 'waiting_approval') {
-      return { state: 'canceled' };
+      state.status = 'waiting_approval';
+      await persistTeamState(job, state);
+      return { state: 'waiting_approval' };
     }
 
     const current = await readTeamState(job);
-    state = current;
+    const nowMs = Date.now();
+    const staleRunning = current.tasks.filter((task) => task.status === 'running' && isClaimExpired(task, nowMs));
+    const nonReportingRunning = current.tasks.filter((task) => isTaskNonReporting(task, nowMs));
+    const normalizedClaims = normalizeRunningClaims(current);
+    const refreshedState = refreshRunningClaims(normalizedClaims);
+    state = refreshedState;
+
+    if (JSON.stringify(normalizedClaims) !== JSON.stringify(refreshedState)) {
+      const claimRecoveredTaskIds = state.tasks
+        .filter((task) => task.status === 'queued' || task.status === 'blocked')
+        .map((task) => task.id);
+      if (claimRecoveredTaskIds.length > 0) {
+        await addEvent(job.id, 'team.claim_recovered', 'Recovered or refreshed task claims for scheduling', {
+          taskIds: claimRecoveredTaskIds,
+        });
+      }
+      await persistTeamState(job, state);
+    }
+
+    if (staleRunning.length > 0) {
+      await addEvent(job.id, 'team.task.non_reporting', 'Recovered stale running tasks based on heartbeat expiry', {
+        taskIds: staleRunning.map((task) => task.id),
+        reason: `claim lease / heartbeat stale (${TEAM_TASK_NON_REPORTING_GRACE_MS}ms grace)`,
+      });
+    }
+
+    if (nonReportingRunning.length > staleRunning.length) {
+      const nonReportingIds = nonReportingRunning.map((task) => task.id);
+      await addEvent(job.id, 'team.task.non_reporting', 'Recovered tasks from non-reporting heartbeat lag', {
+        taskIds: nonReportingIds,
+        reason: `heartbeat stale over ${TEAM_TASK_NON_REPORTING_GRACE_MS}ms`,
+      });
+    }
 
     const parallelLimit = Math.max(1, state.parallelTasks ?? options.parallelism);
     const runnable = selectRunnableTasks(state).slice(0, parallelLimit);
@@ -1248,20 +1594,25 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
         await persistTeamState(job, state);
         throw new Error('team run blocked with no runnable tasks');
       }
+
+      state.status = 'running';
       state.fixAttempts += 1;
       await persistTeamState(job, state);
       await addEvent(job.id, 'team.blocked', 'No runnable task; applying fix attempt backoff');
-      await sleep(1000);
+      await sleep(withBackoffDelay(idleBackoff));
+      idleBackoff += 1;
       continue;
     }
 
     if (runnable.length === 0) {
       idleCycles += 1;
-      await sleep(1000);
+      idleBackoff += 1;
+      await sleep(withBackoffDelay(idleBackoff));
       continue;
     }
 
     idleCycles = 0;
+    idleBackoff = 0;
 
     state = startTaskBatch(state, runnable);
     await persistTeamState(job, state);
@@ -1275,7 +1626,7 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
     }
 
     const results = await Promise.all(
-      runningBatch.map((task) => executeTeamTask(job, options, task, state.phase, workspaceDir)),
+      runningBatch.map((task) => executeTeamTask(job, options, task, state.tasks, state.phase, workspaceDir)),
     );
 
     for (const result of results) {
@@ -1283,6 +1634,31 @@ async function runTeamOrchestration(job: JobRecord): Promise<RunResult> {
     }
 
     state.phase = toTeamTaskPhase(state.tasks);
+
+    const requiresApproval = results.some((result) => result.requiresApproval);
+    if (requiresApproval) {
+      state.status = 'waiting_approval';
+      const approvalTask = results.find((result) => result.requiresApproval);
+      const approvalTaskId = approvalTask?.taskId ?? 'unknown';
+      await persistTeamState(job, state);
+      await jobStore.updateJob(job.id, {
+        status: 'waiting_approval',
+        approvalState: 'required',
+        error: `Team task requires approval: ${approvalTaskId}`,
+      });
+      await addEvent(job.id, 'team.waiting_approval', `Team task requires approval: ${approvalTaskId}`, {
+        taskId: approvalTaskId,
+      });
+      return {
+        state: 'waiting_approval',
+        output: {
+          phase: state.phase,
+          status: state.status,
+          tasks: state.tasks as unknown as Record<string, unknown>,
+        },
+      };
+    }
+
     await persistTeamState(job, state);
   }
 
@@ -1639,6 +2015,11 @@ async function processJobById(jobId: string) {
       : await runProviderOrchestration(current);
 
   if (runResult.state === 'canceled') {
+    return;
+  }
+
+  if (runResult.state === 'waiting_approval') {
+    await addEvent(jobId, 'waiting_approval', 'Team run paused for approval');
     return;
   }
 

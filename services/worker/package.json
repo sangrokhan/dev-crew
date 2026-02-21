@@ -5,7 +5,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start:dev": "ts-node src/index.ts",
-    "start:prod": "node dist/index.js"
+    "start:prod": "node dist/index.js",
+    "test": "node -r ts-node/register --test --experimental-test-coverage --test-reporter=spec tests/*.test.ts"
   },
   "dependencies": {
     "bullmq": "^5.53.2",

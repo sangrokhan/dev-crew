@@ -97,10 +97,8 @@ curl -s -X POST http://localhost:8080/v1/jobs/{jobId}/actions/resume
 ### 4) 실행 중 모니터링
 
 - 팀 상태 파일:
-  - `.omx/state/team/<team-name>/tasks/`
-  - `.omx/state/team/<team-name>/workers/`
-  - `.omx/state/team/<team-name>/events.jsonl`
-  - `.omx/state/team/<team-name>/monitor-snapshot.json`
+  - `.omx/state/jobs/<job-id>/record.json` (`job.options.team.state` 포함)
+  - `.omx/state/jobs/<job-id>/events.jsonl`
 - API 이벤트: `/v1/jobs/{jobId}/events`
 - 검증 체크 기준:
   - `pending=0`, `blocked=0`, `in_progress=0`
@@ -116,7 +114,7 @@ tmux kill-session -t <session-name>
 ```
 - 작업 잔존 상태 정리(옵션):
 ```bash
-rm -rf .omx/state/team/<team-name>
+rm -rf .omx/state/jobs/<job-id>
 rm -rf .omx/state/jobs
 ```
 

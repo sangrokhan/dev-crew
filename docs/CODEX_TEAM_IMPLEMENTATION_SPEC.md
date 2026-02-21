@@ -1,13 +1,33 @@
 # Codex CLI Team 오케스트레이션 구현 명세서
 
-작성일: 2026-02-20  
+작성일: 2026-02-21  
 대상: `oh-my-codex` 없이 순수 `codex` CLI + 외부 오케스트레이터로 Team 동작 구현
+
+## 문서 동기화 기준 체크리스트 (2026-02-21)
+
+- [x] Provider 스펙 동기화: `gemini`를 OpenAPI/실행 경로와 정렬
+- [x] 팀 상태 저장소 경로 동기화: `.omx/state/jobs/<job-id>` 기준으로 정리
+- [x] OpenAPI 스키마 정합성 정비: 문서 계약과 런타임 구현 정렬
+- [x] 구현 미완료 항목 재정렬: 중복 항목을 P0~P3 우선순위로 통합
+- [x] 통합 테스트 실행: 문서 동기화 반영 검증 (최종 단계)
+
+### 우선순위 통합 체크리스트 (P0~P3)
+
+- [x] P0: 팀 상태 저장소 경로 및 상태 스키마 정렬 (`.omx/state/jobs/<job-id>`)
+- [x] P0: parallelTasks 병렬 실행 + backoff/jitter
+- [x] P0: 태스크 claim lease/retry 복구 적용
+- [x] P0: 태스크 단위 승인 게이트(`requiresApproval`) 감지
+- [x] P1: 승인/리뷰 산출물을 다음 단계 입력으로 쓰는 구조화 파이프라인 (`DEPENDENCY_OUTPUTS` 기반)
+- [ ] P1: 분산 worker 협업/메시지 큐 기반 재배정 경로 (미구현)
+- [x] P2: 운영 지표/관측 이벤트 표준화 (`team.state.metrics` 및 `team.task.*` 이벤트)
+- [x] P3: 통합 테스트 실행 (최종)
 
 ## 1. 문서 목적
 
 이 문서는 아래 요구를 충족하기 위해 필요한 구현 항목을 누락 없이 정의한다.
 
-> 본 문서는 초기 DB(Prisma) 중심 설계안과 운영 확장 항목을 포함한다. 현재 저장소의 기본 구현은 `omx.state` 기반 파일 저장소(`.omx/state/jobs`)를 SSOT로 사용하고, 큐는 `REDIS_URL`이 있으면 Redis/BullMQ, 없으면 파일 큐 폴백을 사용한다. 아래의 DB/Prisma 항목은 추후 확장 또는 이원화가 필요할 때만 적용한다.
+> 본 문서는 현재 구현을 기준으로 정리한다. 기본 구현은 `Job.options.team.state`를 포함한 파일 기반 SSOT(`.omx/state/jobs`)를 사용한다.  
+> 별도 영속 저장소 설계는 장기 확장 과제로 분리해 두었으며, 현재 미구현 범위에는 포함하지 않는다.
 
 - `npm install` 이후 실행 가능한 구조.
 - 외부 오케스트레이터가 `codex` CLI를 다중 워커로 제어.
@@ -16,7 +36,7 @@
 
 이 문서는 구현 체크리스트 겸 아키텍처 사양서로 사용한다.
 
-현재 구현 API 매핑(2026-02-20 기준):
+현재 구현 API 매핑(2026-02-21 기준):
 - 실제 운영 엔드포인트는 `POST /v1/jobs` 중심(`GET /v1/jobs/{jobId}`, `GET /v1/jobs/{jobId}/team`, `POST /v1/jobs/{jobId}/actions/{action}`)이다.
 - 본 문서의 `/runs/*` 표기는 확장형 목표 계약(정규화된 Team Run API)이다.
 
@@ -250,167 +270,13 @@
   - approval_wait_seconds
   - fix_loop_count
 
-## 7. 데이터 모델(Prisma 확장안, 레거시)
+## 7. 데이터 모델(현재 운영 기준)
 
-현재 기본 구현은 `Job.options.team.state` 기반 파일 모델로 운영되며, 아래 Prisma 확장안은 별도 DB 도입 시 참고용이다.
+현재 Team 오케스트레이션은 파일 기반 SSOT를 사용한다.
 
-```prisma
-enum TeamRunStatus {
-  queued
-  running
-  waiting_approval
-  succeeded
-  failed
-  canceled
-}
-
-enum TeamPhase {
-  plan
-  research
-  execute
-  verify
-  fix
-  complete
-  failed
-  canceled
-}
-
-enum TeamTaskStatus {
-  pending
-  blocked
-  in_progress
-  completed
-  failed
-  canceled
-}
-
-enum TeamWorkerState {
-  idle
-  booting
-  working
-  blocked
-  done
-  failed
-  stopped
-}
-
-model TeamRun {
-  id                 String          @id @default(uuid())
-  jobId              String          @unique
-  status             TeamRunStatus   @default(queued)
-  phase              TeamPhase       @default(plan)
-  maxFixAttempts     Int             @default(3)
-  currentFixAttempt  Int             @default(0)
-  policy             Json
-  metadata           Json?
-  createdAt          DateTime        @default(now())
-  updatedAt          DateTime        @updatedAt
-  startedAt          DateTime?
-  finishedAt         DateTime?
-  tasks              TeamTask[]
-  workers            TeamWorker[]
-  messages           TeamMessage[]
-  approvals          TeamApproval[]
-  checkpoints        TeamCheckpoint[]
-}
-
-model TeamTask {
-  id                 String          @id @default(cuid())
-  runId              String
-  externalId         String
-  subject            String
-  description        String          @db.Text
-  role               String
-  status             TeamTaskStatus  @default(pending)
-  priority           Int             @default(100)
-  dependsOn          Json            @default("[]")
-  acceptanceCriteria Json            @default("[]")
-  requiresCodeChange Boolean         @default(false)
-  ownerWorkerId      String?
-  result             String?         @db.Text
-  error              String?         @db.Text
-  version            Int             @default(1)
-  createdAt          DateTime        @default(now())
-  updatedAt          DateTime        @updatedAt
-  run                TeamRun         @relation(fields: [runId], references: [id], onDelete: Cascade)
-
-  @@unique([runId, externalId])
-  @@index([runId, status, priority])
-}
-
-model TeamTaskClaim {
-  id                 String          @id @default(cuid())
-  runId              String
-  taskId             String
-  workerId           String
-  claimToken         String          @unique
-  leaseExpiresAt     DateTime
-  releasedAt         DateTime?
-  createdAt          DateTime        @default(now())
-}
-
-model TeamWorker {
-  id                 String          @id @default(cuid())
-  runId              String
-  name               String
-  role               String
-  model              String?
-  state              TeamWorkerState @default(idle)
-  sessionId          String?
-  processId          Int?
-  worktreePath       String?
-  paneId             String?
-  lastHeartbeatAt    DateTime?
-  heartbeatTurns     Int             @default(0)
-  currentTaskId      String?
-  reason             String?
-  createdAt          DateTime        @default(now())
-  updatedAt          DateTime        @updatedAt
-  run                TeamRun         @relation(fields: [runId], references: [id], onDelete: Cascade)
-
-  @@unique([runId, name])
-  @@index([runId, state])
-}
-
-model TeamMessage {
-  id                 String          @id @default(cuid())
-  runId              String
-  fromWorker         String
-  toWorker           String
-  body               String          @db.Text
-  notifiedAt         DateTime?
-  deliveredAt        DateTime?
-  createdAt          DateTime        @default(now())
-  run                TeamRun         @relation(fields: [runId], references: [id], onDelete: Cascade)
-
-  @@index([runId, toWorker, deliveredAt])
-}
-
-model TeamApproval {
-  id                 String          @id @default(cuid())
-  runId              String
-  taskId             String?
-  phase              TeamPhase
-  required           Boolean         @default(true)
-  status             String
-  reviewer           String?
-  reason             String?
-  createdAt          DateTime        @default(now())
-  updatedAt          DateTime        @updatedAt
-  run                TeamRun         @relation(fields: [runId], references: [id], onDelete: Cascade)
-}
-
-model TeamCheckpoint {
-  id                 String          @id @default(cuid())
-  runId              String
-  phase              TeamPhase
-  snapshot           Json
-  createdAt          DateTime        @default(now())
-  run                TeamRun         @relation(fields: [runId], references: [id], onDelete: Cascade)
-
-  @@index([runId, createdAt])
-}
-```
+- 런타임 상태는 `Job.options.team.state` JSON에 저장되며, 팀 상태(`TeamRun`) 및 태스크 상태(`TeamTask`)가 여기에 반영된다.
+- 실행/승인/실패 이벤트는 `Job`의 이벤트 로그(`events.jsonl`)로 추적한다.
+- 추후 영속 저장소 분리는 별도 과제로 남긴다.
 
 ## 8. 상태머신 명세
 
@@ -835,13 +701,12 @@ model TeamCheckpoint {
   - `services/worker/src/team/state-machine.ts`
   - `services/worker/src/team/mailbox.ts`
 
-## 21.3 DB 계층 (선택)
+## 21.3 저장소 확장(운영 적용 전)
 
-- 수정 대상(선택 사항):
-  - `prisma/schema.prisma`
-- 생성 대상:
-  - migration SQL
-  - seed 또는 bootstrap 스크립트.
+- 현재 적용: `Job.options.team.state` 파일 스토리지 + 이벤트 로그
+- 미적용 확장 항목:
+  - 별도 관계형 스토리지 도입
+  - 별도 migration/seed 운영
 
 ## 21.4 계약 문서
 
@@ -947,8 +812,7 @@ model TeamCheckpoint {
 
 ## 26. 즉시 구현 우선순위(실행 순서)
 
-1. (옵션) Prisma 스키마 확장 + 마이그레이션(현재는 DB 미사용).
-2. TeamRun 상태머신 모듈 구현.
+1. TeamRun 상태머신 모듈 구현.
 3. Codex runner 래퍼(`exec`, `resume`, output parse) 구현.
 4. Planner 출력 스키마 검증기 구현.
 5. Task scheduler + claim lease 구현.
@@ -960,23 +824,11 @@ model TeamCheckpoint {
 
 ## 27. 세부 WBS(원자 작업 단위)
 
-### 27.1 DB/Prisma(현재 미구현)
+### 27.1 팀 상태 저장소 계층
 
-- [ ] `prisma/schema.prisma`에 `TeamRunStatus/TeamPhase/TeamTaskStatus/TeamWorkerState` enum 추가.
-- [ ] `TeamRun` 모델 생성.
-- [ ] `TeamTask` 모델 생성.
-- [ ] `TeamTaskClaim` 모델 생성.
-- [ ] `TeamWorker` 모델 생성.
-- [ ] `TeamMessage` 모델 생성.
-- [ ] `TeamApproval` 모델 생성.
-- [ ] `TeamCheckpoint` 모델 생성.
-- [ ] `Job`와 `TeamRun` 관계(1:1) 설계 결정.
-- [ ] run/task/worker 조회 성능용 인덱스 추가.
-- [ ] active claim 조회용 인덱스 추가.
-- [ ] mailbox 미배달 조회용 인덱스 추가.
-- [ ] Prisma migration 생성.
-- [ ] migration rollback 전략 문서화.
-- [ ] `npm run prisma:generate` 후 타입 반영.
+- [x] `Job.options.team.state` 기반 상태 저장 규격 정리
+- [x] 팀 이벤트 추적(`events.jsonl`) 기반 감사/추적 체계 적용
+- [ ] 상태 저장소 분리(별도 영속 계층 전환) 필요 시 정책 문서화
 
 ### 27.2 API(NestJS)
 
@@ -1076,20 +928,20 @@ model TeamCheckpoint {
 - [ ] scheduler unit test.
 - [ ] prompt schema validator unit test.
 - [ ] API contract integration test.
-- [ ] DB migration test.
+- [ ] 상태 저장소 마이그레이션/복구 테스트.
 - [ ] worker process integration test.
 - [ ] fix loop e2e test.
 - [ ] approval 대기/거절 e2e test.
 - [ ] resume 복구 e2e test.
 - [ ] cancel 도중 종료 e2e test.
-- [ ] failure injection test(프로세스 kill, DB down, timeout).
+- [ ] failure injection test(프로세스 kill, 상태 저장소 단절, timeout).
 - [ ] load test(동시 run) 작성.
 - [ ] security test(금지 명령, 마스킹, 권한) 작성.
 
 ### 27.9 CI/CD
 
 - [ ] `npm run build` CI 단계 강화.
-- [ ] Prisma migration 검증 단계 추가.
+- [ ] CI에서 상태 저장소 마이그레이션 없이도 회귀 테스트 유지.
 - [ ] unit/integration/e2e 분리 실행 파이프라인 구성.
 - [ ] flaky test 재시도 정책 추가.
 - [ ] PR 템플릿에 Team 변경 점검 항목 추가.
